@@ -1,0 +1,109 @@
+# Adaptive Asynchronous Hierarchical dFLMoE Configuration
+
+# System Configuration
+system:
+  num_clients: 10
+  device: "cuda"  # "cuda" or "cpu"
+  seed: 42
+
+# Network Configuration
+network:
+  cluster_size: 5
+  top_k_experts: 3
+  maintenance_interval: 10
+
+# Model Architecture
+model:
+  body:
+    type: "simple_cnn"  # "simple_cnn" or "resnet18"
+    input_channels: 3
+    input_size: 32
+  
+  head:
+    hidden_dim: 512
+    output_dim: 10
+    dropout: 0.1
+  
+  router:
+    input_dim: 512
+    hidden_dim: 256
+    temperature: 1.0
+  
+  fst:
+    enabled: false
+    transform_dim: 512
+
+# Training Configuration
+training:
+  local_epochs: 3
+  batch_size: 64
+  learning_rate: 0.01
+  optimizer: "adam"
+  alpha: 0.3
+  gamma: 0.0
+  max_grad_norm: 1.0
+
+# Trust & Staleness
+trust:
+  enabled: true
+  initial_trust: 0.5
+  ema_momentum: 0.9
+  probe_set_size: 100
+
+staleness:
+  lambda_decay: 0.01
+  max_staleness: 100
+
+# Similarity Metrics
+similarity:
+  metric: "cosine"
+  signature_type: "head_embedding"
+  proxy_set_size: 100
+
+# Privacy (Differential Privacy)
+privacy:
+  enabled: false
+  noise_multiplier: 0.1
+  theta_privacy_budget: 1.0
+
+# Communication
+communication:
+  async_mode: true
+  gossip_interval: 10
+  message_timeout: 60
+  compression: false
+
+# Data Configuration
+data:
+  dataset: "cifar10"  # "cifar10", "cifar100", "mnist", "fmnist"
+  data_dir: "./data"
+  
+  # Partitioning method
+  partitioning_method: "label_sharding"  # "label_sharding", "dirichlet", or "iid"
+  
+  # For label_sharding
+  classes_per_client: 2
+  
+  # For dirichlet
+  non_iid: true
+  non_iid_alpha: 0.5
+
+# Clustering
+clustering:
+  method: "knn"
+  similarity_threshold: 0.7
+  min_cluster_size: 3
+  max_cluster_size: 5
+
+# Logging & Checkpointing
+logging:
+  log_dir: "./experiments/logs"
+  log_interval: 10
+  save_checkpoint: true
+  checkpoint_dir: "./experiments/checkpoints"
+  checkpoint_interval: 100
+
+# Evaluation
+evaluation:
+  eval_interval: 50
+  test_batch_size: 256
