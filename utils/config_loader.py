@@ -8,10 +8,10 @@ class Config:
     """Configuration manager with dot notation access"""
     
     def __init__(self, config_dict: Dict[str, Any]):
-        self._config = config_dict
-        self._parse_nested(config_dict)
+        self.config = config_dict
+        self.parse_nested(config_dict)
     
-    def _parse_nested(self, d: Dict[str, Any], prefix: str = ""):
+    def parse_nested(self, d: Dict[str, Any], prefix: str = ""):
         """Parse nested dictionary and create attributes"""
         for key, value in d.items():
             if isinstance(value, dict):
@@ -22,7 +22,7 @@ class Config:
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value with default"""
         keys = key.split('.')
-        value = self._config
+        value = self.config
         for k in keys:
             if isinstance(value, dict):
                 value = value.get(k)
@@ -34,7 +34,7 @@ class Config:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
-        return self._config
+        return self.config
 
 
 def load_config(config_path: str) -> Config:
