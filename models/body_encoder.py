@@ -159,12 +159,12 @@ def create_body_encoder(config, device: torch.device) -> BodyEncoder:
     if body_type == "simple_cnn":
         encoder = SimpleCNNBody(
             input_channels = config.model.body.input_channels,
-            output_dim = config.model.head.hidden_dim
+            output_dim = config.model.head.input_dim
         )
     elif body_type == "resnet18":
         encoder = ResNetBody(
             input_channels = config.model.body.input_channels,
-            output_dim = config.model.head.hidden_dim,
+            output_dim = config.model.head.input_dim,
             pretrained = False
         )
     else:
@@ -243,7 +243,7 @@ def test_body_encoder():
         print(f"Config loaded successfully")
         print(f"Body type: {config.model.body.type}")
         print(f"Input channels: {config.model.body.input_channels}")
-        print(f"Head hidden dim: {config.model.head.hidden_dim}")
+        print(f"Head hidden dim: {config.model.head.input_dim}")
 
         # Create body encoder from config
         body = create_body_encoder(config, device)
@@ -258,8 +258,8 @@ def test_body_encoder():
         print(f"Forward pass successful")
         print(f"Input shape: {dummy_input.shape}")
         print(f"Output shape: {features.shape}")
-        print(f"Expected: ({batch_size}, {config.model.head.hidden_dim})")
-        assert features.shape == (batch_size, config.model.head.hidden_dim), "Output shape mismatch!"
+        print(f"Expected: ({batch_size}, {config.model.head.input_dim})")
+        assert features.shape == (batch_size, config.model.head.input_dim), "Output shape mismatch!"
         print()
     
     # Test 4: Graident flow
