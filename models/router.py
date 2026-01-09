@@ -51,7 +51,7 @@ class ExpertMetadata:
         if "metadata" in head_package:
             metadata = head_package["metadata"]
 
-            # Update trus score from validation accuracy
+            # Update trust score from validation accuracy
             if "validation_accuracy" in metadata:
                 self.validation_accuracy = metadata["validation_accuracy"]
                 self.trust_score = metadata["validation_accuracy"]
@@ -137,13 +137,13 @@ class Router(nn.Module):
                 nn.Linear(hidden_dim, num_experts)
             )
         
-        # Store reference features for each expert for similarity computation
+        # Store reference features for each expert for similarity computation (store each expert's feature spaces)
         ## Stored in buffers (not parameters) -> Saved with model state but not trained
         self.register_buffer(
             "expert_features", torch.zeros(num_experts, feature_dim)
         )
         self.register_buffer(
-            "expert_features_count", torch.zeros(num_experts)
+            "expert_features_count", torch.zeros(num_experts)         # Create buffer to count how many times we've updsated each expert's features
         )
 
     def register_expert_head(
@@ -208,7 +208,7 @@ class Router(nn.Module):
         if expert_id in self.expert_metadata:
             self.expert_metadata[expert_id].update_timestamp()
     
-    def update_trust(
+    def update_expert_trust(
         self,
         expert_id: int,
         performance: float, 
@@ -317,25 +317,25 @@ class Router(nn.Module):
         Implements: Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t{ij})
 
         Args:
-            features: Input features (B, feature_dim)
-            available_experts: List of available expert IDs (None = all)
+            features: Input features (B, feature_dim) from body encoder
+            available_experts: List of available expert IDs (None = all)  - Which experts are available
         
-        Returns:
-            expert_weights: Softmax weights for experts (B, num_experts)
-            expert_indices: Top-k expert indices (B, top_k)
-            scoring_info: Dictionary with detailed scoring breakdown
+        Returns: (expert_weights, expert_indices, scoring_info)
+            expert_weights: Softmax weights for experts (B, num_experts)     - Probabilities for each expert
+            expert_indices: Top-k expert indices (B, top_k)                  - Which experts
+            scoring_info: Dictionary with detailed scoring breakdown         - Detailed information about scores
         """
-        batch_size = features.size(0)
+        batch_size = features.size(0)   # Getting the batch size (number of samples) in features.shape() (B, feature_space_dim)
         device = features.device
 
         if available_experts is None:
             available_experts = list(range(self.num_experts))
         
         # Initialize score matrix and components
-        scores = torch.zeros(batch_size, self.num_experts, device = device)
-        trust_scores = torch.zeros(self.num_experts, device = device)
-        staleness_scores = torch.zeros(self.num_experts, device = device)
-        similarity_scores = torch.zeros(batch_size, self.num_experts, device = device)
+        scores = torch.zeros(batch_size, self.num_experts, device = device)   # (batch_size, num_experts) => Each sample's scores for each expert
+        trust_scores = torch.zeros(self.num_experts, device = device)        # (num_experts, ) => Tracking T_{ij} for each expert
+        staleness_scores = torch.zeros(self.num_experts, device = device)    # (num_experts, ) => Track e^{-lambda * delta_t} for each expert 
+        similarity_scores = torch.zeros(batch_size, self.num_experts, device = device)   # (batch_size, num_experts) => Track S_{ij} for each expert and each sample
 
         # Computing scores for each expert
         for expert_id in available_experts:
@@ -346,8 +346,8 @@ class Router(nn.Module):
             trust_scores[expert_id] = T_ij
 
             # S_{ij}: Feature similarity
-            S_ij = self.compute_similarity(features, expert_id)    # (B, )  
-            similarity_scores[:, expert_id] = S_ij
+            S_ij = self.compute_similarity(features, expert_id)    # Computing similarity between input features and this expert's features -> (B, ) with similarity for each sample (e.g., S_ij = tensor([0.8, 0.6, 0.9, 0.7])) for 4 samples
+            similarity_scores[:, expert_id] = S_ij                 # Stores similarity scores in tensor** -> Store all rows. expert_id selects the column for this expert. 
 
             # e^(-lambda * delta_t{ij}): Staleness Decay
             staleness = self.compute_staleness_factor(expert_id)
@@ -362,29 +362,30 @@ class Router(nn.Module):
             learned_scores = self.scoring_network(features)
             learned_scores = torch.sigmoid(learned_scores)
 
-            # Combine the weighted sum of formula-based and learned scores
+            # Combine the weighted sum of formula-based and learned scores -> Formula gives structure, learning adds adaptability
             scores = 0.7 * scores + 0.3 * learned_scores
 
-        # Applying temperature scaling
+        # Applying temperature scaling -> temperature controls how "sharp" the distribution is
         scaled_scores = scores / self.temperature
     
-        # Masking unavailable experts
+        # Masking unavailable experts -> Set unavailable experts' scores to -inf
         if len(available_experts) < self.num_experts:
-            mask = torch.ones(self.num_experts, dtype = torch.bool, device = device)
-            mask[available_experts] = False
-            scaled_scores = scaled_scores.masked_fill(
-                mask.unsqueeze(0).expand(batch_size, -1),
+            mask = torch.ones(self.num_experts, dtype = torch.bool, device = device)    # Creating boolean mask filled with True : Shape: (10, ) -> Each element is true of false 
+            mask[available_experts] = False                                             # Set available experts to False in mask => e.g.) available_experts = [0, 2, 5]
+            scaled_scores = scaled_scores.masked_fill(                                  # Where mask is True -> replace with -inf (Why -inf? After softmax, -inf becomes 0 probability)
+                mask.unsqueeze(0).expand(batch_size, -1),                               # unsqueeze(0) -> Add dimension at position 0 : Shape: (10, ) -> (1, 10) / expand(batch_size, -1) -> Expand to (batch_size, 10) by keeping the dimension as is. 
                 float("-inf")
             )
         # Compute softmax weights
-        expert_weights = torch.softmax(scaled_scores, dim = 1)
+        expert_weights = torch.softmax(scaled_scores, dim = 1)                          # Apply softmax to convert scores to probabilities dim = 1: Apply softmax across dimension 1 (experts)
 
-        # Select top-k experts
-        top_k_weights, expert_indices = torch.topk(
-            expert_weights,
-            k = min(self.top_k, len(available_experts)),
-            dim = 1,
-            sorted = True
+        # Select top-k experts with highest weights
+        ## top_k_weights: The actual weights of top-k experts, expert_indices: Which experts were selected (e.g. tensor([[1, 0, 2]]) -> Experts 1, 0, 2 are selected)
+        top_k_weights, expert_indices = torch.topk(                                    
+            expert_weights,                                                             # Input: expert_weights (4, 10)
+            k = min(self.top_k, len(available_experts)),                                # k: how many experts to select
+            dim = 1,                                                                    # dim = 1: Select along dimension 1 (experts)
+            sorted = True                                                               # sorted = True: return in descending order
         )
 
         # Detailed scoring information for debugging/analysis
@@ -396,7 +397,7 @@ class Router(nn.Module):
             "available_experts": available_experts
         }
         
-        return expert_weights, expert_indices, scoring_info
+        return expert_weights, expert_indices, scoring_info                             # "expert_weights": (B, num_experts) tensor, "expert_indices": (B, top_k) tensor, "scoring_info": dictionary
 
 def create_router(config, device: torch.device) -> Router:
     """
