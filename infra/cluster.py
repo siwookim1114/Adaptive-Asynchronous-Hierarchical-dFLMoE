@@ -271,30 +271,31 @@ class ClusterManager:
 
             # Determine actual number of clusters
             actual_num_clusters = min(self.num_clusters, len(self.clients))
-            actual_num_clusters = max(1, actual_num_clusters)
+            actual_num_clusters = max(1, actual_num_clusters)     # Make sure we have atleast 1 cluster
 
             # Perform K-Means clustering
             if actual_num_clusters == 1:
                 # All in one cluster
-                labels = np.zeros(len(client_ids), dtype = int)
+                labels = np.zeros(len(client_ids), dtype = int)    # If only 1 cluster -> All clients are in group 0. Create a list of 0s. 
             else:
                 kmeans = KMeans(
-                    n_clusters = actual_num_clusters,
-                    random_state = 42,
-                    n_init = 10
+                    n_clusters = actual_num_clusters,      # How many groups (clusters) to create
+                    random_state = 42,   
+                    n_init = 10                            # Try 10 different starting points and pick the best
                 )
-                labels = kmeans.fit_predict(features_matrix)
+                labels = kmeans.fit_predict(features_matrix)      # Analyzes the data and assigns each client to a cluster
             
-            # Clear existing clusters
-            self.clusters.clear()
+            # Clear existing clusters -> Delete all old clusters and start fresh
+            self.clusters.clear()      
 
-            # Create new clusters
+            # Create new clusters -> Create new empty cluster objects and store them in a dictionary
             for i in range(actual_num_clusters):
                 cluster = Cluster(cluster_id = i)
                 self.clusters[i] = cluster
 
             # Assign clients to clusters
-            for client_id, label in zip(client_ids, labels):
+            ## Loop through clients and their assigned labels together. Zip() pairs them up by (client1, label1), (client2, label2), ...
+            for client_id, label in zip(client_ids, labels):  
                 cluster_id = int(label)
                 client_info = self.clients[client_id]
                 client_info.cluster_id = cluster_id     # Assign cluster id to client 
@@ -305,15 +306,15 @@ class ClusterManager:
             
             # Compute cluster centroids
             for cluster_id, cluster in self.clusters.items():
-                self.compute_cluster_centroid(cluster_id) 
+                self.compute_cluster_centroid(cluster_id)   # Calculate "centroid" center point. Average of all members' features 
             
             # Select cluster heads (highest trust in each cluster)
             for cluster_id in self.clusters.keys():
-                self.select_cluester_head(cluster_id)
+                self.select_cluster_head(cluster_id) 
             
             # Update state
             self.last_cluster_time = time.time()
-            self.clustering_needed = False
+            self.clustering_needed = False    # Mark clustering is done. 
 
             # Update statistics
             with self.stats_lock:
@@ -365,5 +366,216 @@ class ClusterManager:
         else:
             cluster.centroid = np.mean(features_list, axis = 0)
 
+    def select_cluster_head(self, cluster_id: int):
+        """
+        Select cluster head (client with highest trust score)
 
+        Args:
+            cluster_id: Cluster to select head for
+        """
+        if cluster_id not in self.clusters:
+            return
+        
+        cluster = self.clusters[cluster_id]
+        if len(cluster.member_ids) == 0:
+            cluster.cluster_head_id = None
+            return
+
+        # Find client with highest trust score
+        best_client_id = None
+        best_trust = -1.0
+
+        for client_id in cluster.member_ids:
+            if client_id in self.clients:
+                client_info = self.clients[client_id]
+                if client_info.trust_score > best_trust:
+                    best_trust = client_info.trust_score
+                    best_client_id = client_id
+        
+        # Update cluster head
+        old_head = cluster.cluster_head_id
+        cluster.cluster_head_id = best_client_id
+
+        # Update client info
+        if old_head and old_head in self.clients:
+            self.clients[old_head].is_cluster_head = False
+        
+        if best_client_id and best_client_id in self.clients:
+            self.clients[best_client_id].is_cluster_head = True
+        
+        print(f"[ClusterManager] Cluster {cluster_id} head: {best_client_id} "
+              f"(trust = {best_trust:.3f})")
+        
+    def should_recluster(self) -> bool:
+        """
+        Check if re-clustering is needed
+
+        Returns:
+            True if clustering should be performed
+        """
+        if self.clustering_needed:
+            return True
+
+        # Check if enough time has passed
+        if time.time() - self.last_cluster_time > self.recluster_interval:
+            return True
+        
+        return False
+
+    def get_cluster_peers(self, client_id: str) -> List[str]:
+        """
+        Get all peers in the same cluster
+
+        Args:
+            client_id: Client to get peers for
+        
+        Returns: 
+            List of peer IDs (excluding self)
+        """
+        with self.clients_lock, self.cluster_lock:
+            if client_id not in self.clients:
+                return []
+            
+            client_info = self.clients[client_id]
+            cluster_id = client_info.cluster_id
+
+            if cluster_id is None or cluster_id not in self.clusters:
+                return []
+            
+            cluster = self.clusters[cluster_id]
+
+            # Return all members except self
+            peers = [id for id in cluster.member_ids if id != client_id]
+            return peers
+    
+    def get_cluster_heads(self, exclude_own_cluster: bool = False, my_client_id: Optional[str] = None) -> List[str]:
+        """
+        Get all cluster heads
+
+        Args:
+            exclude_own_cluster: Exclude head of own cluster
+            my_client_id: Client ID to exclude their cluster head
+
+        Returns:
+            List of cluster head IDs
+        """
+        with self.cluster_lock:
+            heads = []
+
+            # Get own cluster if excluding
+            my_cluster_id = None
+            if exclude_own_cluster and my_client_id:
+                with self.clients_lock:
+                    if my_client_id in self.clients:
+                        my_cluster_id = self.clients[my_client_id].cluster_id
+            
+            # Collect cluster heads
+            for cluster_id, cluster in self.clusters.items():
+                # Skip own cluster if requested
+                if exclude_own_cluster and cluster_id == my_cluster_id:
+                    continue
+
+                if cluster.cluster_head_id:
+                    heads.append(cluster.cluster_head_id)
+
+            return heads
+    
+    def get_cluster_id(self, client_id: str) -> Optional[int]:
+        """
+        Get cluster ID for a client
+
+        Args:
+            client_id: Client to query
+        
+        Returns:
+            Cluster ID or None
+        """
+        with self.clients_lock:
+            if client_id in self.clients:
+                return self.clients[client_id].cluster_id
+            return None
+    
+    def is_cluster_head(self, client_id: str) -> bool:
+        """
+        Check if client is a custer head
+
+        Args:
+            client_id: Client to check
+        
+        Returns:
+            True if cluster head
+        """
+        with self.clients_lock:
+            if client_id in self.clients:
+                return self.clients[client_id].is_cluster_head
+            return False
+    
+    def get_communication_targets(self, client_id: str) -> Dict[str, List[str]]:
+        """
+        Get communication targets for hierarchical exchange
+
+        Returns:
+            Dictionary with:
+            - "cluster_peers": Peers in same cluster (frequent exchange)
+            - "cluster_heads": Other cluster heads (less frequent)
+        """
+        targets = {
+            "cluster_peers": [],
+            "cluster_heads": []
+        }
+
+        # Get cluster peers (frequent exchange)
+        targets["cluster_peers"] = self.get_cluster_peers(client_id)
+
+        # Get other cluster heads (less frequent exchange)
+        if self.is_cluster_head(client_id):
+            targets["cluster_heads"] = self.get_cluster_heads(
+                exclude_own_cluster = True,
+                my_client_id = client_id
+            )
+        
+        return targets
+    
+    def get_statistics(self) -> Dict:
+        """Get cluster statistics"""
+        with self.stats_lock:
+            return self.stats
+    
+    def print_statistics(self):
+        """Print formatted cluster statistics"""
+        stats = self.get_statistics()
+        
+        print(f"\n{'='*60}")
+        print(f"CLUSTER MANAGER STATISTICS")
+        print(f"{'='*60}")
+        print(f"Total Clients: {stats['total_clients']}")
+        print(f"Total Clusters: {stats['total_clusters']}")
+        print(f"Avg Cluster Size: {stats['avg_cluster_size']:.1f}")
+        print(f"Reclustering Count: {stats['num_reclustering']}")
+        
+        # Communication reduction
+        n = stats['total_clients']
+        if n > 1:
+            without_clustering = n * (n - 1)  # O(N²)
+            
+            # With clustering: within + across
+            k = stats['total_clusters']
+            if k > 0:
+                avg_size = stats['avg_cluster_size']
+                within = k * avg_size * (avg_size - 1)  # Within clusters
+                across = k * (k - 1)  # Across clusters (heads only)
+                with_clustering = within + across
+                
+                reduction = (1 - with_clustering / without_clustering) * 100
+                print(f"\nCommunication Reduction:")
+                print(f"  Without clustering: {without_clustering} connections")
+                print(f"  With clustering: {with_clustering:.0f} connections")
+                print(f"  Reduction: {reduction:.1f}%")
+        
+        print(f"{'='*60}\n")
+
+        
+    
+
+                
 
