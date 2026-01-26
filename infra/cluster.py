@@ -52,3 +52,42 @@ class ClientInfo:
         return (f"ClientInfo(id = {self.client_id}, cluster={self.cluster_id}, "
                 f"trust={self.trust_score:.3f}{head_str})")
     
+class Cluster:
+    """
+    A cluster of similar clients
+
+    Attributes:
+        cluster_id: Unique identifier for this cluster
+        member_ids: Set of client IDs in this cluster
+        cluster_head_id: ID of the cluster head (highest trust)
+        centroid: Average feature vector of all members
+        last_updated: Timestamp of last update
+    """
+    def __init__(self, cluster_id: int):
+        """Initialize cluster"""
+        self.cluster_id = cluster_id
+        self.member_ids: Set[str] = set()
+        self.cluster_head_id: Optional[str] = None
+        self.centroid: Optional[torch.Tensor] = None
+        self.last_updated = time.time()
+
+    def add_member(self, client_id: str):
+        """Add client to cluster"""
+        self.member_ids.add(client_id)
+        self.last_updated = time.time()
+
+    def remove_member(self, client_id: str):
+        """Remove client from cluster"""
+        if self.cluster_head_id == client_id:
+            self.cluster_head_id = None
+        self.last_updated = time.time()
+    
+    def size(self) -> int:
+        """Get number of members"""
+        return len(self.member_ids)
+    
+    def __repr__(self) -> str:
+        """String representation"""
+        return (f"Cluster(id={self.cluster_id}, size={self.size()}, "
+                f"head={self.cluster_head_id})")
+    
