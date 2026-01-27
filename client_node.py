@@ -309,6 +309,144 @@ class ClientNode:
         else:
             print(f"[ClientNode:{self.client_id}]Failed to cache expert from "
                   f"{package.client_id}")
+            
+    def compute_representative_features(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
+        """
+        Compute representative features (average embeddings from data)
+
+        Args:
+            data_loader: Training data loader
+        
+        Returns:
+            Representative features (feature_dim,)
+        """
+        if self.body_encoder is None:
+            print(f"[ClientNode:{self.client_id}] Body encoder not set")
+            return torch.randn(self.feature_dim)
+
+        self.body_encoder.eval()
+        features_list = []
+
+        with torch.no_grad():
+            for x, _ in data_loader:
+                # Get device from model
+                device = next(self.body_encoder.parameters()).device
+                x = x.to(device)
+
+                # Extract features
+                features = self.body_encoder(x)
+                features_list.append(features)
+            
+        # Compute mean
+        if len(features_list) > 0:
+            all_features = torch.cat(features_list, dim = 0)
+            representative = all_features.mean(dim = 0)
+            self.representative_features = representative
+            return representative 
+        else:
+            return self.representative_features
+    
+    def compute_trust_score(self, validation_accuracy: float, num_samples: float):
+        """
+        Compute trust score based on validation accuracy and data size
+
+        Args:
+            validation_accuracy: Validation accuracy (0 to 1)
+            num_samples: Number of training samples
+        """
+        # Base trust on accuracy
+        accuracy_component = validation_accuracy
+
+        # Data size component(more data = more trust)
+        # Normalize by 10000 samples
+        data_component = min(1.0, num_samples / 10000.0)
+
+        # Combined trust (weighted_average)
+        self.trust_score = 0.7 * accuracy_component + 0.3 * data_component
+        self.trust_score = max(0.0, min(1.0, self.trust_score))  # Clamp to [0, 1]
+
+        self.validation_accuracy = validation_accuracy
+        self.num_samples = num_samples
+
+        with self.stats_lock:
+            self.stats["trust_updates"] += 1
+        
+        print(f"[ClientNode:{self.client_id}] Trust updated: {self.trust_score:.3f} "
+              f"(acc={validation_accuracy:.3f}, samples={num_samples})")
+    
+    def create_expert_package(self) -> ExpertPackage:
+        """
+        Create expert package for sharing
+
+        Returns:
+            ExpertPackage with current expert head
+        """
+        if self.head is None:
+            raise ValueError("Head not set")
+        
+        package = ExpertPackage(
+            client_id = self.client_id,
+            head_state_dict = self.head.state_dict(),
+            timestamp = time.time(),
+            trust_score = self.trust_score,
+            validation_accuracy = self.validation_accuracy,
+            representative_features = self.representative_features,
+            num_samples = self.num_samples
+        )
+
+        return package
+    
+    def share_expert(self):
+        """
+        Share expert package with peers (hierarchical)
+
+        Shares with:
+        - Cluster peers (every cluster_exchange_interval_rounds)
+        - Cluster heads (every cross_cluster_exchange_interval rounds, if head)
+        """
+        # Create expert package
+        package = self.create_expert_package()
+
+        # Get communication targets
+        targets = self.cluster_manager.get_communication_targets(self.client_id) # Get the targets for each client_id respective Nodes
+        
+        experts_sent = 0
+
+        # Within cluster (frequent)
+        if self.current_round % self.cluster_exchange_interval == 0:
+            cluster_peers = targets["cluster_peers"]
+            if len(cluster_peers) > 0:
+                num_sent = self.transport.broadcast(
+                    cluster_peers,
+                    "expert_package",
+                    package
+                )
+                experts_sent += num_sent
+                print(f"[ClientNode:{self.client_id}] Shared with "
+                      f"{num_sent}/{len(cluster_peers)} cluster peers")
+        
+        # Across clusters (less frequent, if cluster head)
+        if self.current_round % self.cross_cluster_exchange_interval == 0:
+            if self.cluster_manager.is_cluster_head(self.client_id):
+                cluster_heads = targets["cluster_heads"]
+                if len(cluster_heads) > 0:
+                    num_sent = self.transport.broadcast(
+                        cluster_heads,
+                        "expert_package",
+                        package
+                    )
+                    experts_sent += num_sent
+                    print(f"[ClientNode:{self.client_id}] Shared with "
+                          f"{num_sent}/{len(cluster_heads)} cluster heads "
+                          f"(CROSS-CLUSTER)")
+        
+        with self.stats_lock:
+            self.stats["experts_sent"] += experts_sent
+        
+    
+
+
+        
     
 
 
