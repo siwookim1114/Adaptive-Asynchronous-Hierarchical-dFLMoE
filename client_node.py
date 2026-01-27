@@ -442,6 +442,259 @@ class ClientNode:
         
         with self.stats_lock:
             self.stats["experts_sent"] += experts_sent
+    
+    def train_round(
+        self,
+        train_loader: torch.utils.data.DataLoader,
+        val_loader: torch.utils.data.DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: nn.Module,
+        device: torch.device,
+        use_experts: bool = True
+    ) -> Dict:
+        """
+        Complete training round
+
+        Args:
+            train_loader: Training data loader
+            val_loader: Validation data loader
+            optimizer: Optimizer
+            criterion: Loss function to minimize
+            device: Device to train on
+            use_experts: Whether to use cached experts for routing
+
+        Returns:
+            Dictionary with training metrics
+        """
+        if self.body_encoder is None or self.head is None:
+            raise ValueError("Model not set properly.")
+
+        self.current_round += 1
+        print(f"\n[ClientNode:{self.client_id}] "
+              f"{"=" * 50}\n"
+              f"Round {self.current_round}\n"
+              f"{"=" * 50}")
+        
+        # 1. Local Training
+        train_loss, train_acc = self._train_epoch(
+            train_loader, optimizer, criterion, device, use_experts
+        )
+
+        # 2. Validation
+        val_loss, val_acc = self._validate(val_loader, criterion, device, use_experts)
+
+        # 3. Update trust score
+        self.compute_trust_score(val_acc, len(train_loader.dataset))
+
+        # 4. Compute representative features
+        self.compute_representative_features(train_loader)    # Extract training data features
+
+        # 5. Update cluster manager
+        self.cluster_manager.update_client(
+            client_id = self.client_id,
+            features = self.representative_features,
+            trust_score = self.trust_score
+        )
+
+        # 6. Check if re-clustering needed
+        if self.cluster_manager.should_recluster():
+            print(f"[ClientNode:{self.client_id}] Re-clustering...")
+            self.cluster_manager.perform_clustering()
+
+        # 7. Share expert with peers
+        self.share_expert()
+
+        # 8. uUpdate statistics
+        with self.stats_lock:
+            self.stats["rounds_completed"] += 1
+
+        # Return metrics
+        metrics = {
+            "round": self.current_round,
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "trust_score": self.trust_score,
+            "cache_size": self.cache.size(),
+            "is_cluster_head": self.cluster_manager.is_cluster_head(self.client_id)
+        }
+
+        print(f"[ClientNode:{self.client_id}] "
+              f"Train: {train_loss:.4f}/{train_acc:.3f}, "
+              f"Val: {val_loss:.4f}/{val_acc:.3f}, "
+              f"Trust: {self.trust_score:.3f}, "
+              f"Cache: {self.cache.size()}")
+        
+        return metrics
+    
+    def _train_epoch(
+        self,
+        data_loader: torch.utils.data.DataLoader,
+        optimizer: optim.Optimizer,
+        criterion: nn.Module,
+        device: torch.device,
+        use_experts: bool
+    ) -> Tuple[float, float]:
+        """Train for one epoch"""
+        self.body_encoder.train()
+        self.head.train()
+
+        total_loss = 0.0
+        correct, total = 0, 0
+
+        for batch_idx, (x, y) in enumerate(data_loader):
+            x, y = x.to(device), y.to(device)
+
+            # Forward pass
+            features = self.body_encoder(x)
+
+            # Use experts if available
+            if use_experts and self.cache.size() > 0:
+                # Get available experts
+                expert_packages = self.cache.get_available_experts(
+                    exclude_id = self.client_id
+                )
+                if len(expert_packages) > 0:
+                    # Route with experts
+                    expert_logits = self.router.forward(
+                        features, expert_packages, k = self.top_k_experts
+                    )
+
+                    # Local prediction
+                    local_logits = self.head(features)
+
+                    # Combine (weighted average)
+                    logits = 0.5 * local_logits + 0.5 * expert_logits
+
+                    with self.stats_lock:
+                        self.stats["experts_used"] += len(expert_packages)
+                    
+                else:
+                    logits = self.head(features)
+            else:
+                logits = self.head(features)
+
+            # Loss and backward
+            loss = criterion(logits, y)
+            optimizer.zero_grad()
+            loss.backward()     # Backpropagation
+            optimizer.step()
+
+            # Metrics
+            total_loss += loss.item()
+            _, predicted = logits.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+        
+        avg_loss = total_loss / len(data_loader)
+        accuracy = correct / total
+        
+        return avg_loss, accuracy
+
+    def _validate(
+        self,
+        data_loader: torch.utils.DataLoader,
+        criterion: nn.Module,
+        device: torch.device,
+        use_experts: bool
+    ) -> Tuple[float, float]:
+        """Validate"""
+        self.body_encoder.eval()
+        self.head.eval()
+
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        with torch.no_grad():
+            for x, y in data_loader:
+                x, y = x.to(device), y.to(device)
+
+                # Forward pass
+                features = self.body_encoder(x)
+
+                # Use experts if available
+                if use_experts and self.cache.size() > 0:
+                    expert_packages = self.cache.get_available_experts(
+                        exclude_id = self.client_id
+                    )
+
+                    if len(expert_packages) > 0:
+                        expert_logits = self.router.forward(
+                            features, expert_packages, k = self.top_k_experts
+                        )
+                        local_logits = self.head(features)
+                        logits = 0.5 * local_logits + 0.5 * expert_logits
+                    else:
+                        logits = self.head(features)
+                else:
+                    logits = self.head(features)
+                
+                # Metrics
+                loss = criterion(logits, y)
+                total_loss += loss.item()
+                _, predicted = logits.max(1)
+                total += y.size(0)
+                correct += predicted.eq(y).sum().item()
+        avg_loss = total_loss / len(data_loader)
+        accuracy = correct / total
+
+        return avg_loss, accuracy
+    
+    def get_statistics(self) -> Dict:
+        """Get node statistics"""
+        with self.stats_lock:
+            stats = self.stats
+
+        # Add component stats
+        stats["transport"] = self.transport.get_statistics()
+        stats["cache"] = self.cache.get_statistics()
+        stats["cluster"] = {
+            "cluster_id": self.cluster_manager.get_cluster_id(self.client_id),
+            "is_head": self.cluster_manager.is_cluster_head(self.client_id),
+            "cluster_size": len(self.cluster_manager.get_cluster_peers(self.client_id)) + 1
+        }
+        return stats
+    
+    def print_statistics(self):
+        """Print formatted statistics"""
+        stats = self.get_statistics()
+        
+        print(f"\n{'='*60}")
+        print(f"CLIENT NODE STATISTICS ({self.client_id})")
+        print(f"{'='*60}")
+        print(f"Rounds Completed: {stats['rounds_completed']}")
+        print(f"Experts Sent: {stats['experts_sent']}")
+        print(f"Experts Received: {stats['experts_received']}")
+        print(f"Experts Used: {stats['experts_used']}")
+        print(f"Trust Updates: {stats['trust_updates']}")
+        print(f"Current Trust: {self.trust_score:.3f}")
+        print(f"Cache Size: {self.cache.size()}")
+        print(f"Cluster ID: {stats['cluster']['cluster_id']}")
+        print(f"Is Cluster Head: {stats['cluster']['is_head']}")
+        print(f"{'='*60}\n")
+    
+    def shutdown(self):
+        """Shutdown node"""
+        print(f"[ClientNode:{self.client_id}] Shutting down...")
+        
+        # Stop transport
+        self.transport.shutdown()
+        
+        # Remove from cluster manager
+        self.cluster_manager.remove_client(self.client_id)
+        
+        print(f"[ClientNode:{self.client_id}] Shutdown complete")
+
+
+
+
+
+
+
+
+        
         
     
 
