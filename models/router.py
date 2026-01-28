@@ -1,15 +1,8 @@
 """
-Router: Expert selection with trust-weighted scoring
-
-Implements the complete scoring formula:
-Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t_{ij})
-
-Where:
-- T_{ij} : Trust score (validation accuracy from head metadata)
-- S_{ij}: Feature similarity (Cosine Distance)
-- e^(-lambda * delta_t_{ij}) : Staleness decay factor
-
-Integrates with Head's metadata system for complete expert evaluation
+1. Explicit scoring: Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t_{ij})
+2. Learnable gating: sigmoid(proj(features) · expert_emb_j / √d) * base_score
+3. Feature Space Transforms: FST_{i -> j}
+4. MoE Aggregation
 """
 
 import torch
@@ -17,7 +10,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Tuple, Optional, Dict
 import time
-from head import Head
+import math
+from fst import FeatureSpaceTransform
 
 import sys
 from pathlib import Path
@@ -31,7 +25,7 @@ class ExpertMetadata:
     """
     Metadata for each expert: M_j = {T, S, delta_t}
 
-    This stores information received from peer heaads via their metadata.
+    This stores information received from peer heads via their metadata.
     """
     def __init__(self, expert_id: int):
         self.expert_id = expert_id
@@ -91,6 +85,10 @@ class Router(nn.Module):
     Router for expert selection with complete trust-weighted scoring
 
     Implements: Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t{ij})
+    - Explicit scoring formula
+    - Learnable gating network
+    - FST integration
+    - MoE aggregation
     """
 
     def __init__(
@@ -98,45 +96,56 @@ class Router(nn.Module):
         feature_dim: int = 512, 
         hidden_dim: int = 256,
         num_experts: int = 10,
+        num_classes: int = 10,
         temperature: float = 1.0,
         top_k: int = 3,
         staleness_lambda: float = 0.001,
-        similarity_type: str = "cosine"
+        similarity_type: str = "cosine",
+        use_learned_gating: bool = True
     ):
         """
         Args:
             feature_dim: Input feature dimension (from body encoder)
             hidden_dim: Hidden layer dimension for scoring network
             num_experts: Number of available experts(clients)
-            temperature: Temperature for softmax (higher = more uniform)
+            num_classes: Number of output classes
+            temperature: Temperature for softmax (higher = more uniform) for routing
             top_k: Number of top experts to select
             staleness_lambda: Lambda parameter for e^(-lambda * delta_t)
             similarity_type: Type of similarity ("cosine" or "kl")
+            use_learned_gating: Enable learnable gating network
         """
         super().__init__()
         self.feature_dim = feature_dim
         self.hidden_dim = hidden_dim
         self.num_experts = num_experts
+        self.num_classes = num_classes
         self.temperature = temperature
         self.top_k = min(top_k, num_experts)
         self.staleness_lambda = staleness_lambda
         self.similarity_type = similarity_type
+        self.use_learned_gating = use_learned_gating
 
         # Expert metadata storage
         self.expert_metadata: Dict[int, ExpertMetadata] = {
             i : ExpertMetadata(i) for i in range(num_experts)    # {expert_id: Metadata(expert_id)}
         }
 
-        # Neural network for learning additional routing patterns
-        self.use_learned_routing = True
-        if self.use_learned_routing:
-            self.scoring_network = nn.Sequential(
-                nn.Linear(feature_dim, hidden_dim),
-                nn.ReLU(inplace = True),
-                nn.Dropout(0.1),
-                nn.Linear(hidden_dim, num_experts)
-            )
-        
+        # Learned gating via scaled dot-product: sigmoid(proj(features) · expert_emb_j / √d)
+        if self.use_learned_gating:
+            # Project input features into hidden space (computed once per input)
+            self.feature_projector = nn.Linear(feature_dim, hidden_dim)
+
+            # Learnable embedding per expert (indexed by expert_id)
+            self.expert_embeddings = nn.Embedding(num_experts, hidden_dim)
+            # Small init so sigmoid(~0) ≈ 0.5, letting base_score dominate initially
+            nn.init.normal_(self.expert_embeddings.weight, mean=0, std=0.01)
+
+            print(f"[Router] Gating: proj({feature_dim}->{hidden_dim}) · expert_emb({num_experts}x{hidden_dim})")
+            
+        # Feature Space Trnasforms (one per expert)
+        self.fst_transforms = nn.ModuleDict()
+
         # Store reference features for each expert for similarity computation (store each expert's feature spaces)
         ## Stored in buffers (not parameters) -> Saved with model state but not trained
         self.register_buffer(
@@ -145,33 +154,51 @@ class Router(nn.Module):
         self.register_buffer(
             "expert_features_count", torch.zeros(num_experts)         # Create buffer to count how many times we've updsated each expert's features
         )
-
-    def register_expert_head(
-        self, 
-        expert_id: int,
-        head_package: Dict,
-        features: Optional[torch.Tensor] = None
-    ):
+    
+    def get_or_create_fst(self, expert_id: int) -> FeatureSpaceTransform:
         """
-        Register an expert head with its complete metadata
+        Get or create FST_{i->j} for expert j
 
-        Should be called when receiving a head package from a peer. 
-        Updates: trust score, timestamp, feature embedding
+        FST aligns features from local space to expert's space.
+        Created lazily when expert is first registered.
 
         Args:
             expert_id: Expert ID
-            head_package: Complete package from Head.get_head_package()
-            features: Optional feature embedding for similarity computation
+        
+        Returns:
+            FST module for this expert
         """
+        expert_key = str(expert_id)    # ModuleDict requires string keys
+
+        if expert_key not in self.fst_transforms:
+            # Create new FST (from fst.py)
+            fst = FeatureSpaceTransform(self.feature_dim)
+            self.fst_transforms[expert_key] = fst    # Create fst and store it
+            print(f"[Router] Created FST for expert {expert_id}")
+        
+        return self.fst_transforms[expert_key]
+
+    def register_expert(
+        self,
+        expert_id: int,
+        trust_score: float,
+        validation_accuracy: float,
+        features: torch.Tensor,
+        num_samples: int = 0,
+        timestamp: Optional[float] = None
+    ):
+        """Register an expert with router"""
         if expert_id not in self.expert_metadata:
             self.expert_metadata[expert_id] = ExpertMetadata(expert_id)
+        
+        metadata = self.expert_metadata[expert_id]
+        metadata.trust_score = trust_score
+        metadata.validation_accuracy = validation_accuracy
+        metadata.num_samples = num_samples
+        metadata.last_update_time = timestamp if timestamp else time.time()
 
-        # Update metadata from head package
-        self.expert_metadata[expert_id].update_from_head_package(head_package)
-
-        # Update feature embedding if provided
-        if features is not None:
-            self.update_expert_features(expert_id, features)
+        self.update_expert_features(expert_id, features)
+        self.get_or_create_fst(expert_id)
     
     def update_expert_features(
         self, 
@@ -187,8 +214,9 @@ class Router(nn.Module):
         """
         if features.dim() == 2:
             features = features.mean(dim = 0)   # Average if batch
-        
-        # Exponential if moving average
+        features = features.detach().to(self.expert_features.device)
+
+        # Exponential moving average
         alpha = 0.1
         if self.expert_features_count[expert_id] == 0:
             self.expert_features[expert_id] = features
@@ -198,32 +226,6 @@ class Router(nn.Module):
             )
         
         self.expert_features_count[expert_id] += 1
-    
-    def update_expert_timestamp(self, expert_id: int):
-        """
-        Update timestamp when expert sends new head
-
-        This resets delta_t -> 0, so staleness factor -> 1.0
-        """
-        if expert_id in self.expert_metadata:
-            self.expert_metadata[expert_id].update_timestamp()
-    
-    def update_expert_trust(
-        self,
-        expert_id: int,
-        performance: float, 
-        decay: float = 0.95
-    ):
-        """
-        Update trust score based on validation accuracy
-
-        Args:
-            expert_id: Expert ID
-            performance: Validation accuracy (0 - 1)
-            decay: EMA decay factor
-        """
-        if expert_id in self.expert_metadata:
-            self.expert_metadata[expert_id].update_trust(performance, decay)
     
     def compute_similarity(
         self, 
@@ -237,11 +239,18 @@ class Router(nn.Module):
             features: Input features (B, feature_dim)
             expert_id: Expert ID
         """
+        if features.dim() == 1:
+            features = features.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
         expert_feat = self.expert_features[expert_id].unsqueeze(0)    # (1, feature_dim)
 
         if self.expert_features_count[expert_id] == 0:
-            # Nofeatures stored yet -> Then return neutral similarity
-            return torch.ones(features.size(0), device = features.device)
+            # No features stored yet -> Then return neutral similarity (0.5)
+            result = torch.ones(features.size(0), device = features.device) * 0.5
+            return result
 
         if self.similarity_type == "cosine":
             # Cosine similarity: (f1 dot f2) / (||f1|| ||f2||)
@@ -260,7 +269,7 @@ class Router(nn.Module):
         
         else:
             raise ValueError(f"Unknown similarity type: {self.similarity_type}")
-        return similarity
+        return similarity.squeeze(0) if squeeze_output else similarity
     
     def compute_staleness_factor(self, expert_id: int) -> float:
         """
@@ -268,433 +277,194 @@ class Router(nn.Module):
 
         Args:
             expert_id: Expert ID
-        
+
         Returns:
             staleness_factor: Decay factor in [0, 1]
         """
         metadata = self.expert_metadata[expert_id]
         delta_t = metadata.get_staleness()
+        return math.exp(-self.staleness_lambda * delta_t)
+    
+    def compute_base_score(self, trust: float, similarity: float, staleness_factor: float) -> float:
+        """
+        Computes base score: Score = T * S * staleness_factor
 
-        # e^(-lambda * delta_t)
-        staleness_factor = torch.exp(torch.tensor(-self.staleness_lambda * delta_t))
-        return staleness_factor.item()
+        Args:
+            trust: Trust score T_{ij}
+            similarity: Feature similarity score S_{ij}
+            staleness_factor: Pre-computed decay factor e^(-lambda * delta_t) in [0, 1]
 
-    def get_expert_status(self, expert_id: int) -> Dict:
-        """Get current status of an expert"""
-        if expert_id not in self.expert_metadata:
-            return {}
+        Returns:
+            Base score from the combination of the three factors
+        """
+        return trust * similarity * staleness_factor
+    
+    def compute_routing_weight(
+        self,
+        query_features: torch.Tensor,
+        expert_id: int,
+        projected_features: Optional[torch.Tensor] = None
+    ) -> float:
+        """
+        Computes the routing weight using metadata and per-expert learned gate
+
+        Gate = sigmoid(proj(features) · expert_emb_j / √hidden_dim)
+        Final = gate × base_score
+
+        Args:
+            query_features: Input embeddings (Input data)
+            expert_id: Expert ID of the expert
+            projected_features: Pre-computed feature projection to avoid redundant forward passes
+
+        Returns:
+            Computed final score combining metadata base score and learned gate
+        """
         metadata = self.expert_metadata[expert_id]
-        staleness = self.compute_staleness_factor(expert_id)
+        trust = metadata.trust_score
+        similarity = self.compute_similarity(query_features, expert_id)
+
+        if isinstance(similarity, torch.Tensor):
+            similarity = similarity.item()
+
+        staleness_factor = self.compute_staleness_factor(expert_id)
+        base_score = self.compute_base_score(trust, similarity, staleness_factor)
+
+        if self.use_learned_gating:
+            if projected_features is None:
+                projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
+
+            expert_emb = self.expert_embeddings(
+                torch.tensor(expert_id, device=query_features.device)
+            )
+            affinity = torch.dot(projected_features, expert_emb) / math.sqrt(self.hidden_dim)
+            gate_value = torch.sigmoid(affinity).item()
+            return gate_value * base_score
+
+        return base_score
+    
+    def select_top_k_experts(
+        self,
+        query_features: torch.Tensor,
+        available_experts: Optional[List[int]] = None,
+        k: Optional[int] = None
+    ) -> Tuple[List[int], torch.Tensor]:
+        """
+        Selects top-K experts from the available experts with computed routing weight for each data input
+
+        Args:
+            query_features: Input embeddings (Input data)
+            available_experts: Experts that could be used for selection
+            k: Number of experts to use
+
+        Returns:
+            (selected_expert_ids, normalized_weights)
+        """
+        if k is None:
+            k = self.top_k
+        if available_experts is None:
+            available_experts = list(range(self.num_experts))
+
+        # Pre-compute feature projection once (shared across all experts)
+        projected_features = None
+        if self.use_learned_gating:
+            with torch.no_grad():
+                projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
+
+        scores = []
+        valid_expert_ids = []
+
+        for expert_id in available_experts:
+            if self.expert_features_count[expert_id] > 0:
+                score = self.compute_routing_weight(query_features, expert_id, projected_features=projected_features)
+                scores.append(score)
+                valid_expert_ids.append(expert_id)
+
+        if len(scores) == 0:
+            return [], torch.tensor([])
+
+        scores = torch.tensor(scores, device=query_features.device)
+        k = min(k, len(scores))
+        top_k_scores, top_k_indices = torch.topk(scores, k)
+        normalized_weights = F.softmax(top_k_scores / self.temperature, dim=0)
+        selected_ids = [valid_expert_ids[i] for i in top_k_indices]
+        return selected_ids, normalized_weights
+    
+    def forward_moe(
+        self,
+        features: torch.Tensor,
+        expert_heads: Dict[int, nn.Module],
+        available_experts: Optional[List[int]] = None,
+        k: Optional[int] = None
+    ) -> torch.Tensor:
+        """MoE Forward Passes with FST integrated"""
+        batch_size = features.size(0)
+        device = features.device
+        outputs = torch.zeros(batch_size, self.num_classes, device=device)
+
+        if len(expert_heads) == 0:
+            return outputs
+
+        # Filter to only experts that have heads available (prevents weight loss from skipping)
+        if available_experts is None:
+            valid_experts = list(expert_heads.keys())
+        else:
+            valid_experts = [eid for eid in available_experts if eid in expert_heads]
+
+        if len(valid_experts) == 0:
+            return outputs
+
+        for i in range(batch_size):
+            query_features = features[i]
+            selected_ids, weights = self.select_top_k_experts(query_features, valid_experts, k)
+
+            if len(selected_ids) == 0:
+                continue
+
+            sample_output = torch.zeros(self.num_classes, device=device)
+
+            for expert_id, weight in zip(selected_ids, weights):
+                fst = self.get_or_create_fst(expert_id)
+                fst = fst.to(device)
+                aligned_features = fst(query_features.unsqueeze(0))
+
+                expert_head = expert_heads[expert_id]
+                expert_head.eval()
+
+                with torch.no_grad():
+                    expert_logits = expert_head(aligned_features).squeeze(0)
+
+                sample_output += weight * expert_logits
+            outputs[i] = sample_output
+        return outputs
+    
+    def get_expert_status(self, expert_id: int) -> Dict:
+        if expert_id not in self.expert_metadata:
+            return {"expert_id": expert_id, "registered": False}
+        
+        metadata = self.expert_metadata[expert_id]
+        staleness_factor = self.compute_staleness_factor(expert_id)
 
         return {
             "expert_id": expert_id,
+            "registered": True,
             "trust_score": metadata.trust_score,
             "validation_accuracy": metadata.validation_accuracy,
-            "staleness_factor": staleness,
+            "staleness_factor": staleness_factor,
             "delta_t": metadata.get_staleness(),
             "num_samples": metadata.num_samples,
-            "has_features": self.expert_features_count[expert_id].item() > 0
+            "has_features": self.expert_features_count[expert_id].item() > 0,
+            "has_fst": str(expert_id) in self.fst_transforms
         }
-    
+
     def get_all_expert_status(self) -> List[Dict]:
-        """Get status of all experts"""
-        return [self.get_expert_status(i) for i in range(self.num_experts)]
+        return [self.get_expert_status(i) for i in range(self.num_experts) if self.expert_features_count[i] > 0]
     
     def reset_expert(self, expert_id: int):
-        """Reset an expert's metadata (e.g., when peer disconnects)"""
         if expert_id in self.expert_metadata:
             self.expert_metadata[expert_id] = ExpertMetadata(expert_id)
             self.expert_features_count[expert_id] = 0
-    
-    def forward(
-        self, 
-        features: torch.Tensor, 
-        available_experts: Optional[List[int]] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
-        """
-        Forward pass: Compute expert selection scores
-
-        Implements: Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t{ij})
-
-        Args:
-            features: Input features (B, feature_dim) from body encoder
-            available_experts: List of available expert IDs (None = all)  - Which experts are available
-        
-        Returns: (expert_weights, expert_indices, scoring_info)
-            expert_weights: Softmax weights for experts (B, num_experts)     - Probabilities for each expert
-            expert_indices: Top-k expert indices (B, top_k)                  - Which experts
-            scoring_info: Dictionary with detailed scoring breakdown         - Detailed information about scores
-        """
-        batch_size = features.size(0)   # Getting the batch size (number of samples) in features.shape() (B, feature_space_dim)
-        device = features.device
-
-        if available_experts is None:
-            available_experts = list(range(self.num_experts))
-        
-        # Initialize score matrix and components
-        scores = torch.zeros(batch_size, self.num_experts, device = device)   # (batch_size, num_experts) => Each sample's scores for each expert
-        trust_scores = torch.zeros(self.num_experts, device = device)        # (num_experts, ) => Tracking T_{ij} for each expert
-        staleness_scores = torch.zeros(self.num_experts, device = device)    # (num_experts, ) => Track e^{-lambda * delta_t} for each expert 
-        similarity_scores = torch.zeros(batch_size, self.num_experts, device = device)   # (batch_size, num_experts) => Track S_{ij} for each expert and each sample
-
-        # Computing scores for each expert
-        for expert_id in available_experts:
-            metadata = self.expert_metadata[expert_id]
-
-            # T_{ij}: Trust Score (from validation accuracy)
-            T_ij = metadata.trust_score
-            trust_scores[expert_id] = T_ij
-
-            # S_{ij}: Feature similarity
-            S_ij = self.compute_similarity(features, expert_id)    # Computing similarity between input features and this expert's features -> (B, ) with similarity for each sample (e.g., S_ij = tensor([0.8, 0.6, 0.9, 0.7])) for 4 samples
-            similarity_scores[:, expert_id] = S_ij                 # Stores similarity scores in tensor** -> Store all rows. expert_id selects the column for this expert. 
-
-            # e^(-lambda * delta_t{ij}): Staleness Decay
-            staleness = self.compute_staleness_factor(expert_id)
-            staleness_scores[expert_id] = staleness
-
-            # Integrated: Score_{ij} = T_{ij} * S_{ij} * e^(-lambda * delta_t)
-            expert_score = T_ij * S_ij * staleness    # (B, )
-            scores[:, expert_id] = expert_score
-        
-        # Optional: Add learning routing component
-        if self.use_learned_routing:
-            learned_scores = self.scoring_network(features)
-            learned_scores = torch.sigmoid(learned_scores)
-
-            # Combine the weighted sum of formula-based and learned scores -> Formula gives structure, learning adds adaptability
-            scores = 0.7 * scores + 0.3 * learned_scores
-
-        # Applying temperature scaling -> temperature controls how "sharp" the distribution is
-        scaled_scores = scores / self.temperature
-    
-        # Masking unavailable experts -> Set unavailable experts' scores to -inf
-        if len(available_experts) < self.num_experts:
-            mask = torch.ones(self.num_experts, dtype = torch.bool, device = device)    # Creating boolean mask filled with True : Shape: (10, ) -> Each element is true of false 
-            mask[available_experts] = False                                             # Set available experts to False in mask => e.g.) available_experts = [0, 2, 5]
-            scaled_scores = scaled_scores.masked_fill(                                  # Where mask is True -> replace with -inf (Why -inf? After softmax, -inf becomes 0 probability)
-                mask.unsqueeze(0).expand(batch_size, -1),                               # unsqueeze(0) -> Add dimension at position 0 : Shape: (10, ) -> (1, 10) / expand(batch_size, -1) -> Expand to (batch_size, 10) by keeping the dimension as is. 
-                float("-inf")
-            )
-        # Compute softmax weights
-        expert_weights = torch.softmax(scaled_scores, dim = 1)                          # Apply softmax to convert scores to probabilities dim = 1: Apply softmax across dimension 1 (experts)
-
-        # Select top-k experts with highest weights
-        ## top_k_weights: The actual weights of top-k experts, expert_indices: Which experts were selected (e.g. tensor([[1, 0, 2]]) -> Experts 1, 0, 2 are selected)
-        top_k_weights, expert_indices = torch.topk(                                    
-            expert_weights,                                                             # Input: expert_weights (4, 10)
-            k = min(self.top_k, len(available_experts)),                                # k: how many experts to select
-            dim = 1,                                                                    # dim = 1: Select along dimension 1 (experts)
-            sorted = True                                                               # sorted = True: return in descending order
-        )
-
-        # Detailed scoring information for debugging/analysis
-        scoring_info = {
-            "trust_scores" : trust_scores,
-            "similarity_scores": similarity_scores,
-            "staleness_scores": staleness_scores,
-            "raw_scores": scores,
-            "available_experts": available_experts
-        }
-        
-        return expert_weights, expert_indices, scoring_info                             # "expert_weights": (B, num_experts) tensor, "expert_indices": (B, top_k) tensor, "scoring_info": dictionary
-
-def create_router(config, device: torch.device) -> Router:
-    """
-    Factory function to create router from config
-
-    Args:
-        config: Configuration object with router settings
-        device: torch.device to place model on
-
-    Returns:
-        Router module
-    """
-    router = Router(
-        feature_dim = config.model.router.input_dim,
-        hidden_dim = config.model.router.hidden_dim,
-        num_experts = config.system.num_clients,
-        temperature = config.model.router.temperature,
-        top_k = config.network.top_k_experts,
-        staleness_lambda = getattr(config.network, "staleness_lambda", 0.001),
-        similarity_type = "cosine"
-    )
-
-    torch.backends.cudnn.benchmark = True
-    return router.to(device)
-
-
-# Testing Functions
-
-def test_router():
-    """Test router functionality"""
-    print("\n" + "="*70)
-    print("TESTING ROUTER (COMPLETE INTEGRATION WITH HEAD)")
-    print("="*70 + "\n")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}\n")
-    
-    # Test 1: Router Creation and Buffer Verification
-    print("TEST 1: Router Creation and Buffer Verification")
-    print("-" * 70)
-    
-    router = Router(
-        feature_dim=512,
-        hidden_dim=256,
-        num_experts=10,
-        temperature=1.0,
-        top_k=3,
-        staleness_lambda=0.001
-    ).to(device)
-    
-    num_params = sum(p.numel() for p in router.parameters())
-    print(f"✓ Router created")
-    print(f"  Parameters: {num_params:,}")
-    print(f"  Staleness lambda: {router.staleness_lambda}")
-    
-    # Verify buffers exist
-    print(f"\nVerifying buffers:")
-    print(f"  expert_features shape: {router.expert_features.shape}")
-    print(f"  expert_features_count shape: {router.expert_features_count.shape}")
-    assert router.expert_features.shape == (10, 512), "expert_features shape wrong!"
-    assert router.expert_features_count.shape == (10,), "expert_features_count shape wrong!"
-    print(f"  Buffers correctly initialized!")
-    print()
-    
-    # Test 2: Integration with Head Package
-    print("TEST 2: Integration with Head Package")
-    print("-" * 70)
-    
-    try:        
-        # Create mock head with metadata
-        head = Head(input_dim=512, output_dim=10).to(device)
-        head.update_metadata(
-            validation_accuracy=0.87,
-            num_samples=5000,
-            expert_id=0
-        )
-
-        # Get complete package
-        head_package = head.get_head_package(expert_id=0)
-        
-        print("Head package created")
-        print(f"  Validation accuracy: {head_package['metadata']['validation_accuracy']:.2f}")
-        print(f"  Trust score: {head_package['metadata']['trust_score']:.2f}")
-        
-        # Register with router
-        dummy_features = torch.randn(512).to(device)
-        router.register_expert_head(
-            expert_id=0,
-            head_package=head_package,
-            features=dummy_features
-        )
-        
-        print("\n Head registered with router")
-        status = router.get_expert_status(0)
-        print(f"  Router trust score: {status['trust_score']:.2f}")
-        print(f"  Router validation acc: {status['validation_accuracy']:.2f}")
-        print(f"  Staleness factor: {status['staleness_factor']:.4f}")
-        print(f"  Has features: {status['has_features']}")
-        
-        # Verify expert_features was updated
-        assert router.expert_features_count[0] > 0, "Features not stored!"
-        print(f"  Feature count: {router.expert_features_count[0].item()}")
-        
-        assert abs(status['trust_score'] - 0.87) < 0.01, "Trust score mismatch!"
-        print()
-    
-    except ImportError:
-        print("head.py not found, using mock data")
-        
-        # Create mock head package
-        mock_package = {
-            'weights': {},
-            'metadata': {
-                'timestamp': time.time(),
-                'trust_score': 0.87,
-                'validation_accuracy': 0.87,
-                'num_samples': 5000,
-                'expert_id': 0
-            }
-        }
-        
-        dummy_features = torch.randn(512).to(device)
-        router.register_expert_head(0, mock_package, dummy_features)
-        status = router.get_expert_status(0)
-        print(f"✓ Mock head registered")
-        print(f"  Trust score: {status['trust_score']:.2f}")
-        print(f"  Has features: {status['has_features']}")
-        print()
-    
-    # Test 3: Complete Scoring Formula
-    print("TEST 3: Complete Scoring Formula (T * S * e^(-λΔt))")
-    print("-" * 70)
-    
-    batch_size = 4
-    test_features = torch.randn(batch_size, 512).to(device)
-    
-    # Set up multiple experts with different metadata
-    for i in range(5):
-        expert_feat = torch.randn(512).to(device)
-        router.update_expert_features(i, expert_feat)
-        
-        # Different trust scores
-        if i == 0:
-            router.update_trust(i, 0.9)  # High trust
-        elif i == 2:
-            router.update_trust(i, 0.5)  # Medium trust
-    
-    # Verify features were stored
-    print("Expert features stored:")
-    for i in range(5):
-        count = router.expert_features_count[i].item()
-        print(f"  Expert {i}: {count} updates")
-    
-    with torch.no_grad():
-        expert_weights, expert_indices, scoring_info = router(test_features)
-    
-    print(f"\n  Forward pass with complete formula")
-    print(f"\n  Expert Status (first 3):")
-    for i in range(3):
-        status = router.get_expert_status(i)
-        print(f"    Expert {i}:")
-        print(f"      Trust (T): {status['trust_score']:.4f}")
-        print(f"      Staleness (e^(-λΔt)): {status['staleness_factor']:.4f}")
-        print(f"      Δt: {status['delta_t']:.2f}s")
-        print(f"      Has features: {status['has_features']}")
-    
-    print(f"\n  Sample 0 - Top-{router.top_k} selected:")
-    for i in range(router.top_k):
-        expert_id = expert_indices[0, i].item()
-        weight = expert_weights[0, expert_id].item()
-        status = router.get_expert_status(expert_id)
-        print(f"    Expert {expert_id}: weight={weight:.4f}, trust={status['trust_score']:.2f}")
-    print()
-    
-    # Test 4: Staleness Decay Over Time
-    print("TEST 4: Staleness Decay (Offline Peer)")
-    print("-" * 70)
-    
-    print("Scenario: Expert 5 goes offline")
-    
-    # Fresh update
-    router.update_expert_timestamp(5)
-    status_fresh = router.get_expert_status(5)
-    print(f"  Fresh: staleness = {status_fresh['staleness_factor']:.6f}")
-    
-    # Wait
-    print("\n  Waiting 2 seconds...")
-    time.sleep(2)
-    
-    status_stale = router.get_expert_status(5)
-    print(f"  After 2s: Δt = {status_stale['delta_t']:.2f}s")
-    print(f"  After 2s: staleness = {status_stale['staleness_factor']:.6f}")
-    print(f"  Decay: {(1 - status_stale['staleness_factor']) * 100:.2f}%")
-    
-    assert status_stale['staleness_factor'] < status_fresh['staleness_factor']
-    print("\n Staleness decay working")
-    print()
-    
-    # Test 5: Expert Returns
-    print("TEST 5: Expert Returns (Fresh Update)")
-    print("-" * 70)
-    
-    print("Scenario: Expert 5 reconnects")
-    router.update_expert_timestamp(5)
-    
-    status_restored = router.get_expert_status(5)
-    print(f"  After update: Δt = {status_restored['delta_t']:.6f}s")
-    print(f"  After update: staleness = {status_restored['staleness_factor']:.6f}")
-    
-    assert status_restored['staleness_factor'] > 0.99
-    print("\n Staleness restored")
-    print()
-    
-    # Test 6: Feature Similarity
-    print("TEST 6: Feature Similarity (S_ij)")
-    print("-" * 70)
-    
-    test_feat = torch.randn(1, 512).to(device)
-    
-    # Similar features
-    similar = test_feat[0] + 0.1 * torch.randn(512).to(device)
-    router.update_expert_features(6, similar)
-    
-    # Different features
-    different = torch.randn(512).to(device)
-    router.update_expert_features(7, different)
-    
-    sim_6 = router.compute_similarity(test_feat, 6)
-    sim_7 = router.compute_similarity(test_feat, 7)
-    
-    print(f"  Similarity to Expert 6 (similar): {sim_6.item():.4f}")
-    print(f"  Similarity to Expert 7 (different): {sim_7.item():.4f}")
-    
-    # Verify feature counts were updated
-    print(f"\n  Feature counts:")
-    print(f"    Expert 6: {router.expert_features_count[6].item()}")
-    print(f"    Expert 7: {router.expert_features_count[7].item()}")
-    
-    assert sim_6 > sim_7
-    print("\n Similarity computation working")
-    print()
-    
-    # Test 7: Available Experts Masking
-    print("TEST 7: Available Experts Masking")
-    print("-" * 70)
-    
-    available = [0, 2, 5, 7]
-    
-    with torch.no_grad():
-        weights, indices, info = router(test_features, available_experts=available)
-    
-    print(f"Available: {available}")
-    print(f"Selected (sample 0):")
-    for i in range(router.top_k):
-        eid = indices[0, i].item()
-        in_avail = "✓" if eid in available else "✗"
-        print(f"  Expert {eid} [{in_avail}]")
-    
-    selected = indices[0].tolist()
-    assert all(e in available for e in selected)
-    print("\n✓ Masking working")
-    print()
-    
-    # Test 8: create_router with config
-    print("TEST 8: create_router() with config")
-    print("-" * 70)
-    
-    try:
-        config_path = project_root / 'configs' / 'config.yaml'
-        
-        if config_path.exists():
-            config = load_config(str(config_path))
-            router_config = create_router(config, device)
-            
-            print(f"✓ Router from config")
-            print(f"  Num experts: {router_config.num_experts}")
-            print(f"  Top-k: {router_config.top_k}")
-            
-            # Verify buffers in config router
-            print(f"  Buffers exist: {hasattr(router_config, 'expert_features')}")
-            print(f"  Buffer shape: {router_config.expert_features.shape}")
-            print()
-        else:
-            print(" Config not found")
-            print()
-    
-    except Exception as e:
-        print(f" Error: {e}")
-        print()
-    
-    print("=" * 70)
-    print("ALL TESTS PASSED!")
-    print("=" * 70 + "\n")
-
-
-if __name__ == "__main__":
-    test_router()
-
-
-
+            expert_key = str(expert_id)
+            if expert_key in self.fst_transforms:
+                del self.fst_transforms[expert_key]
+            if self.use_learned_gating and expert_id < self.num_experts:
+                nn.init.normal_(self.expert_embeddings.weight[expert_id], mean=0, std=0.01)
