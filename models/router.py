@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import List, Tuple, Optional, Dict
 import time
 import math
-from fst import FeatureSpaceTransform
+from models.fst import FeatureSpaceTransform
 
 import sys
 from pathlib import Path
@@ -19,8 +19,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 from utils.config_loader import load_config
-
-
 class ExpertMetadata:
     """
     Metadata for each expert: M_j = {T, S, delta_t}
@@ -365,10 +363,10 @@ class Router(nn.Module):
             available_experts = list(range(self.num_experts))
 
         # Pre-compute feature projection once (shared across all experts)
+        # Note: No torch.no_grad() here to allow gradient flow for router learning
         projected_features = None
         if self.use_learned_gating:
-            with torch.no_grad():
-                projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
+            projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
 
         scores = []
         valid_expert_ids = []
@@ -430,8 +428,9 @@ class Router(nn.Module):
                 expert_head = expert_heads[expert_id]
                 expert_head.eval()
 
-                with torch.no_grad():
-                    expert_logits = expert_head(aligned_features).squeeze(0)
+                # Note: No torch.no_grad() to allow gradient flow through FST
+                # Expert head params won't be updated since they're not in any optimizer
+                expert_logits = expert_head(aligned_features).squeeze(0)
 
                 sample_output += weight * expert_logits
             outputs[i] = sample_output

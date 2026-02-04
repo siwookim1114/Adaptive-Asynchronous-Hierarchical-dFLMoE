@@ -247,19 +247,21 @@ class PeerCache:
         with self.lock:
             return self.cache
     
-    def get_available_experts(self, exclude_id: Optional[str] = None) -> List[str]:
+    def get_available_experts(self, exclude_id: Optional[str] = None) -> List[ExpertPackage]:
         """
-        Get list of available expert IDs
+        Get list of available expert packages
 
         Args:
             exclude_id: Client ID to exclude (typically own ID)
         Returns:
-            List of available expert client IDs
+            List of available ExpertPackage objects
         """
         with self.lock:
-            available = list(self.cache.keys())
-            if available is not None:
-                available = [id for id in available if id != exclude_id]
+            available = []
+            for client_id, package in self.cache.items():
+                if exclude_id is not None and client_id == exclude_id:
+                    continue
+                available.append(package)
             return available
     
     def get_by_staleness(self, min_staleness: float = 0.5, exclude_id: Optional[str] = None) -> List[Tuple[str, ExpertPackage]]:
@@ -413,7 +415,7 @@ class PeerCache:
     def is_full(self) -> bool:
         """Check if cache is at capacity"""
         with self.lock:
-            return len(self.cache) >= self.max_cache_sizeL
+            return len(self.cache) >= self.max_cache_size
     
     def get_statistics(self) -> Dict:
         """Get cache statistics"""
@@ -431,7 +433,7 @@ class PeerCache:
                 }
             ages = [package.get_age_seconds() for package in self.cache.values()]
             trusts = [package.trust_score for package in self.cache.values()]
-            stalenesses = [package.get_staleness(self.staleness.decay) for package in self.cache.values()]
+            stalenesses = [package.get_staleness(self.staleness_decay) for package in self.cache.values()]
             hit_rate = (self.stats["hits"] / self.stats["gets"] if self.stats["gets"] > 0 else 0.0)
 
             return {
@@ -447,7 +449,7 @@ class PeerCache:
     
     def print_statistics(self):
         """Print formatted statistics"""
-        stats = self.get_satistics()
+        stats = self.get_statistics()
         print(f"\n{'='*60}")
         print("PEER CACHE STATISTICS")
         print(f"{'='*60}")

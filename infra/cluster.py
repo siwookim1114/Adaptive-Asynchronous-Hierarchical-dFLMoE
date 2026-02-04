@@ -313,7 +313,7 @@ class ClusterManager:
                 self.select_cluster_head(cluster_id) 
             
             # Update state
-            self.last_cluster_time = time.time()
+            self.last_clustering_time = time.time()
             self.clustering_needed = False    # Mark clustering is done. 
 
             # Update statistics
@@ -417,7 +417,7 @@ class ClusterManager:
             return True
 
         # Check if enough time has passed
-        if time.time() - self.last_cluster_time > self.recluster_interval:
+        if time.time() - self.last_clustering_time > self.recluster_interval:
             return True
         
         return False
@@ -480,6 +480,21 @@ class ClusterManager:
 
             return heads
     
+    def get_cluster_members(self, cluster_id: int) -> List[str]:
+        """
+        Get all members of a specific cluster
+
+        Args:
+            cluster_id: Cluster to get members for
+
+        Returns:
+            List of client IDs in the cluster
+        """
+        with self.cluster_lock:
+            if cluster_id not in self.clusters:
+                return []
+            return list(self.clusters[cluster_id].member_ids)
+
     def get_cluster_id(self, client_id: str) -> Optional[int]:
         """
         Get cluster ID for a client

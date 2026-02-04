@@ -140,7 +140,7 @@ class TCPTransport:
         self.running = True
         self.server_thread = threading.Thread(
             target = self.accept_loop,               # Function to run in thread
-            damemon = True,                          # Thread dies when main program exits
+            daemon = True,                          # Thread dies when main program exits
             name = f"Server-{self.client_id}"        # Name for debugging that will be shown in thread list
         )
         self.server_thread.start()         # Starts the thread (begins running _accept_loop in background) -> After this line: Main Thread: Returns from __init__ -> Send messages, Server Thread: Runs _accept_loop() -> Waits for connections -> Accepts connections
@@ -178,7 +178,7 @@ class TCPTransport:
                 handler_thread = threading.Thread(
                     target = self.handle_connection,
                     args = (client_socket, addr),
-                    dameon = True,
+                    daemon = True,
                     name = f"Handler-{self.client_id}=={addr}"   
                 )
                 handler_thread.start()
@@ -437,7 +437,7 @@ class TCPTransport:
         print(f"Connections: {stats['connections_accepted']} accepted, "
               f"{stats['connections_failed']} failed")
         print(f"Errors: {stats['errors']}")
-        print(f"Active Connections: {len(self._peer_sockets)}")
+        print(f"Active Connections: {len(self.peer_sockets)}")
         print(f"{'='*60}\n")
 
     def shutdown(self):
