@@ -265,8 +265,10 @@ def run_federated_learning(args):
         classes_per_client=args.classes_per_client
     )
     print(f"  Created {len(train_loaders)} train loaders")
-    print(f"  Created {len(val_loaders)} val loaders\n")
-    
+    print(f"  Created {len(val_loaders)} val loaders")
+
+    print()
+
     # Create cluster manager
     print("Initializing cluster manager...")
     cluster_manager = ClusterManager(
@@ -382,16 +384,23 @@ def run_federated_learning(args):
                 print(f"  Client {i} error: {e}")
                 continue
         
+        # Re-cluster every 5 rounds (after real features are computed)
+        # Round 1: first recluster with real features (initial was random)
+        if round_num == 1 or round_num % 5 == 0:
+            cluster_manager.perform_clustering()
+
         # Aggregate statistics
         if len(round_metrics) > 0:
             avg_train_loss = np.mean([m['train_loss'] for m in round_metrics])
+            avg_train_loss_local = np.mean([m['train_loss_local'] for m in round_metrics])
+            avg_train_loss_moe = np.mean([m['train_loss_moe'] for m in round_metrics])
             avg_train_acc = np.mean([m['train_acc'] for m in round_metrics])
             avg_val_loss = np.mean([m['val_loss'] for m in round_metrics])
             avg_val_acc = np.mean([m['val_acc'] for m in round_metrics])
             avg_experts_used = np.mean([m['experts_used'] for m in round_metrics])
             
-            # Global test every 10 rounds
-            if round_num % 10 == 0:
+            # Global test every 5 rounds (and always on last round)
+            if round_num % 5 == 0 or round_num == args.rounds:
                 test_acc = evaluate_global(clients, test_loader, device)
                 global_stats['test_acc'].append(test_acc)
             else:
@@ -411,10 +420,10 @@ def run_federated_learning(args):
             print(f"\n{'='*70}")
             print(f"ROUND {round_num} SUMMARY")
             print(f"{'='*70}")
-            print(f"Average Train Loss: {avg_train_loss:.4f}")
-            print(f"Average Train Acc:  {avg_train_acc:.3f}")
-            print(f"Average Val Loss:   {avg_val_loss:.4f}")
-            print(f"Average Val Acc:    {avg_val_acc:.3f}")
+            print(f"Avg Train Loss (total): {avg_train_loss:.4f}  [local: {avg_train_loss_local:.4f}, moe: {avg_train_loss_moe:.4f}]")
+            print(f"Average Train Acc:      {avg_train_acc:.3f}")
+            print(f"Average Val Loss:       {avg_val_loss:.4f}")
+            print(f"Average Val Acc:        {avg_val_acc:.3f}")
             print(f"Avg Experts Used:   {avg_experts_used:.1f}")
             if test_acc is not None:
                 print(f"Global Test Acc:    {test_acc:.3f}")
@@ -472,11 +481,21 @@ def run_federated_learning(args):
     return global_stats
 
 
-def evaluate_global(clients: List[ClientNode], test_loader: DataLoader, device: torch.device) -> float:
+def evaluate_global(
+    clients: List[ClientNode],
+    test_loader: DataLoader,
+    device: torch.device
+) -> float:
     """
-    Evaluate global test accuracy (average of all clients)
+    Evaluate global test accuracy using router-based MoE inference.
 
-    Uses MoE aggregation when experts are available, matching training behavior.
+    Each client produces its prediction purely via its router:
+    1. Router selects top-K experts from all available (including local head)
+    2. Applies per-expert FST and weighted combination
+    3. This MoE output IS the prediction (no fixed alpha combination)
+
+    These MoE predictions are converted to softmax probabilities
+    and trust-weighted ensembled across all clients.
 
     Args:
         clients: List of clients
@@ -484,55 +503,72 @@ def evaluate_global(clients: List[ClientNode], test_loader: DataLoader, device: 
         device: Device
 
     Returns:
-        Average test accuracy
+        Ensemble test accuracy
     """
-    accuracies = []
+    num_classes = clients[0].num_classes
+    correct = 0
+    total = 0
 
+    # Prepare all clients: set eval mode and build expert heads from cache
+    client_expert_heads = []
     for client in clients:
-        if client.body_encoder is None or client.head is None:
-            continue
+        if client.body_encoder is not None:
+            client.body_encoder.eval()
+            client.head.eval()
+            client.router.eval()
 
-        client.body_encoder.eval()
-        client.head.eval()
-        client.router.eval()
+        # Build expert heads from this client's cache (once, not per batch)
+        expert_heads = {}
+        if client.cache.size() > 0:
+            expert_packages = client.cache.get_available_experts(exclude_id=client.client_id)
+            for pkg in expert_packages:
+                eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
+                head_temp = Head(input_dim=client.feature_dim, output_dim=client.num_classes)
+                head_temp.load_state_dict(pkg.head_state_dict)
+                head_temp = head_temp.to(device)
+                head_temp.eval()
+                expert_heads[eid] = head_temp
 
-        correct = 0
-        total = 0
+        # Include local head in expert pool (already in eval mode)
+        expert_heads[client.local_expert_id] = client.head
 
-        with torch.no_grad():
-            for x, y in test_loader:
-                x, y = x.to(device), y.to(device)
+        client_expert_heads.append(expert_heads)
+
+    with torch.no_grad():
+        for x, y in test_loader:
+            x, y = x.to(device), y.to(device)
+
+            ensemble_probs = torch.zeros(x.size(0), num_classes, device=device)
+            total_weight = 0.0
+
+            for i, client in enumerate(clients):
+                if client.body_encoder is None or client.head is None:
+                    continue
 
                 features = client.body_encoder(x)
-                local_logits = client.head(features)
 
-                # Use MoE if experts available (matches training behavior)
-                if client.cache.size() > 0:
-                    expert_packages = client.cache.get_available_experts(exclude_id=client.client_id)
-                    if len(expert_packages) > 0:
-                        expert_heads = {}
-                        for pkg in expert_packages:
-                            eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                            head_temp = Head(input_dim=client.feature_dim, output_dim=client.num_classes)
-                            head_temp.load_state_dict(pkg.head_state_dict)
-                            head_temp = head_temp.to(device)
-                            expert_heads[eid] = head_temp
-
-                        expert_logits = client.router.forward_moe(features, expert_heads, k=client.top_k_experts)
-                        predictions = client.alpha * local_logits + (1 - client.alpha) * expert_logits
-                    else:
-                        predictions = local_logits
+                expert_heads = client_expert_heads[i]
+                if len(expert_heads) > 0:
+                    # Pure MoE: router selects from all experts including local
+                    predictions = client.router.forward_moe(
+                        features, expert_heads, k=client.top_k_experts
+                    )
                 else:
-                    predictions = local_logits
+                    predictions = client.head(features)
 
-                _, predicted = predictions.max(1)
-                total += y.size(0)
-                correct += predicted.eq(y).sum().item()
+                probs = torch.softmax(predictions, dim=1)
+                weight = client.trust_score
+                ensemble_probs += weight * probs
+                total_weight += weight
 
-        accuracy = correct / total
-        accuracies.append(accuracy)
+            if total_weight > 0:
+                ensemble_probs /= total_weight
 
-    return np.mean(accuracies) if len(accuracies) > 0 else 0.0
+            _, predicted = ensemble_probs.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+
+    return correct / total if total > 0 else 0.0
 
 
 def save_results(args, global_stats):
@@ -593,8 +629,8 @@ def save_results(args, global_stats):
             val_acc = global_stats['val_acc'][i]
             experts = global_stats['avg_experts_used'][i]
 
-            # Test acc is recorded every 10 rounds
-            if round_num % 10 == 0 and test_acc_idx < len(global_stats['test_acc']):
+            # Test acc is recorded every 5 rounds and on the last round
+            if (round_num % 5 == 0 or round_num == len(global_stats['round'])) and test_acc_idx < len(global_stats['test_acc']):
                 test_acc_str = f"{global_stats['test_acc'][test_acc_idx]:.4f}"
                 test_acc_idx += 1
             else:

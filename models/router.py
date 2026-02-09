@@ -465,10 +465,11 @@ class Router(nn.Module):
                 aligned_features = fst(query_features.unsqueeze(0))
 
                 expert_head = expert_heads[expert_id]
-                expert_head.eval()
-
-                # Note: No torch.no_grad() to allow gradient flow through FST
-                # Expert head params won't be updated since they're not in any optimizer
+                # Note: Caller is responsible for setting eval/train mode.
+                # Cached heads are already in eval mode; the local head stays
+                # in whatever mode the caller set (train during training).
+                # Cached head params have no optimizer (frozen). The local head
+                # IS in an optimizer, so L_moe gradients provide extra training signal.
                 expert_logits = expert_head(aligned_features).squeeze(0)
 
                 sample_output += weight * expert_logits

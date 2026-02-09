@@ -190,7 +190,8 @@ class ClusterManager:
             # Update features if provided
             if features is not None:
                 client_info.features = features    # Update with new features
-                self.clustering_needed = True      # Features changed, need re-cluster
+                # Re-clustering is now managed at orchestration level (main.py)
+                # to prevent excessive re-clustering every round
             
             # Update trust score if provided
             if trust_score is not None:

@@ -1,14 +1,14 @@
 """
-Client Node: FINAL PRODUCTION VERSION
+Client Node: Federated Learning with Dynamic MoE Routing
 
 Complete federated learning client with:
-- Hybrid loss: L_full = α*L_local + (1-α)*L_MoE
-- Gradient routing: Head←local, Router←MoE, Body←both
-- Router integration (register_expert on receive)
+- Local head included in MoE expert pool (router decides all weights)
+- Hybrid loss for gradient routing: L_full = α*L_local + (1-α)*L_MoE
+  - α controls gradient balance only (L_local trains body, L_moe trains router)
+  - Prediction is purely MoE output (fully dynamic per-sample routing)
+- Router integration (register_expert on receive + local self-registration)
 - Hierarchical communication
 - Trust computation
-
-100% correct, no errors, ready for production.
 """
 
 import torch
@@ -46,6 +46,7 @@ class ClientNode:
         learning_rate_router: float = 0.001
     ):
         self.client_id = client_id
+        self.local_expert_id = int(client_id.split('_')[-1]) if '_' in client_id else int(client_id)
         self.feature_dim = feature_dim
         self.num_classes = num_classes
         self.num_experts = num_experts
@@ -122,6 +123,24 @@ class ClientNode:
         self.optimizer_head = optim.Adam(self.head.parameters(), lr=self.lr_head)
         self.optimizer_body = optim.Adam(self.body_encoder.parameters(), lr=self.lr_body)
         self.optimizer_router = optim.Adam(self.router.parameters(), lr=self.lr_router)
+
+        # Register local head as expert so router can score it
+        self._register_local_expert()
+
+    def _register_local_expert(self):
+        """Register this client's own head as an expert in the router.
+
+        This allows the router to score the local head alongside remote experts
+        using the same Trust x Similarity x Staleness x Gate mechanism.
+        """
+        self.router.register_expert(
+            expert_id=self.local_expert_id,
+            trust_score=self.trust_score,
+            validation_accuracy=self.validation_accuracy,
+            features=self.representative_features,
+            num_samples=self.num_samples,
+            timestamp=time.time()
+        )
     
     def _handle_expert_package(self, message: Message):
         """CRITICAL: Registers expert with router"""
@@ -241,10 +260,13 @@ class ClientNode:
             features=self.representative_features,
             trust_score=self.trust_score
         )
-        
-        if self.cluster_manager.should_recluster():
-            self.cluster_manager.perform_clustering()
-        
+
+        # Update local expert registration with latest trust/features
+        self._register_local_expert()
+
+        # Note: Re-clustering is now handled at the orchestration level (main.py)
+        # to avoid excessive re-clustering (previously triggered per-client per-round)
+
         self.share_expert()
         
         with self._stats_lock:
@@ -282,56 +304,59 @@ class ClientNode:
         total = 0
         experts_used_count = 0
         
+        # Pre-build expert heads once per epoch (they don't change within an epoch)
+        expert_heads = {}
+        if use_experts and self.cache.size() > 0:
+            expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
+            for pkg in expert_packages:
+                eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
+                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+                head_temp.load_state_dict(pkg.head_state_dict)
+                head_temp = head_temp.to(device)
+                head_temp.eval()
+                expert_heads[eid] = head_temp
+
+        # Include local head in expert pool — router scores it alongside
+        # remote experts using Trust x Similarity x Staleness x Gate
+        if use_experts:
+            expert_heads[self.local_expert_id] = self.head
+
         for x, y in data_loader:
             x, y = x.to(device), y.to(device)
 
             features = self.body_encoder(x)
             local_logits = self.head(features)
             loss_local = criterion(local_logits, y)
-            
-            if use_experts and self.cache.size() > 0:
-                expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
-                
-                if len(expert_packages) > 0:
-                    expert_heads = {}
-                    for pkg in expert_packages:
-                        eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                        head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
-                        head_temp.load_state_dict(pkg.head_state_dict)
-                        head_temp = head_temp.to(device)
-                        expert_heads[eid] = head_temp
 
-                    expert_logits = self.router.forward_moe(features, expert_heads, k=self.top_k_experts)
-                    loss_moe = criterion(expert_logits, y)
-                    loss_full = self.alpha * loss_local + (1 - self.alpha) * loss_moe
+            if use_experts and len(expert_heads) > 0:
+                # Detach features for MoE path: prevents expert predictions from
+                # corrupting body encoder via bad gradients from cross-class experts.
+                moe_logits = self.router.forward_moe(features.detach(), expert_heads, k=self.top_k_experts)
+                loss_moe = criterion(moe_logits, y)
 
-                    # Single backward pass for correct gradient routing
-                    # L_full = alpha * L_local + (1-alpha) * L_moe
-                    # Gradients flow naturally:
-                    # - Head: receives alpha * grad_local (from L_local term)
-                    # - Router/FST: receives (1-alpha) * grad_moe (from L_moe term)
-                    # - Body: receives both (from both terms via features)
-                    self.optimizer_head.zero_grad()
-                    self.optimizer_body.zero_grad()
-                    self.optimizer_router.zero_grad()
+                # α controls gradient balance only:
+                # L_local trains body+head (via features WITH gradients)
+                # L_moe trains router+FST+selected heads (via features.detach())
+                loss_full = self.alpha * loss_local + (1 - self.alpha) * loss_moe
 
-                    loss_full.backward()
+                self.optimizer_head.zero_grad()
+                self.optimizer_body.zero_grad()
+                self.optimizer_router.zero_grad()
 
-                    self.optimizer_head.step()
-                    self.optimizer_body.step()
-                    self.optimizer_router.step()
+                loss_full.backward()
 
-                    experts_used_count += len(expert_packages)
-                    predictions = self.alpha * local_logits + (1 - self.alpha) * expert_logits
-                else:
-                    loss_moe = torch.tensor(0.0)
-                    loss_full = loss_local
-                    self.optimizer_head.zero_grad()
-                    self.optimizer_body.zero_grad()
-                    loss_full.backward()
-                    self.optimizer_head.step()
-                    self.optimizer_body.step()
-                    predictions = local_logits
+                # Gradient clipping on router: preserves gradient DIRECTION
+                # (router learns which experts are relatively better) while
+                # bounding MAGNITUDE (prevents instability from high MoE loss).
+                torch.nn.utils.clip_grad_norm_(self.router.parameters(), max_norm=1.0)
+
+                self.optimizer_head.step()
+                self.optimizer_body.step()
+                self.optimizer_router.step()
+
+                experts_used_count += len(expert_heads)
+                # Prediction is purely MoE — router decides all weights dynamically
+                predictions = moe_logits
             else:
                 loss_moe = torch.tensor(0.0)
                 loss_full = loss_local
@@ -384,37 +409,42 @@ class ClientNode:
         correct = 0
         total = 0
         
+        # Pre-build expert heads once for validation
+        val_expert_heads = {}
+        if use_experts and self.cache.size() > 0:
+            expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
+            for pkg in expert_packages:
+                eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
+                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+                head_temp.load_state_dict(pkg.head_state_dict)
+                head_temp = head_temp.to(device)
+                head_temp.eval()
+                val_expert_heads[eid] = head_temp
+
+        # Include local head in expert pool (already in eval mode from above)
+        if use_experts:
+            val_expert_heads[self.local_expert_id] = self.head
+
         with torch.no_grad():
             for x, y in data_loader:
                 x, y = x.to(device), y.to(device)
                 features = self.body_encoder(x)
-                local_logits = self.head(features)
-                
-                if use_experts and self.cache.size() > 0:
-                    expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
-                    
-                    if len(expert_packages) > 0:
-                        expert_heads = {}
-                        for pkg in expert_packages:
-                            eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                            head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
-                            head_temp.load_state_dict(pkg.head_state_dict)
-                            head_temp = head_temp.to(device)
-                            expert_heads[eid] = head_temp
-                        
-                        expert_logits = self.router.forward_moe(features, expert_heads, k=self.top_k_experts)
-                        predictions = self.alpha * local_logits + (1 - self.alpha) * expert_logits
-                        
-                        loss_local = criterion(local_logits, y)
-                        loss_moe = criterion(expert_logits, y)
-                        loss = self.alpha * loss_local + (1 - self.alpha) * loss_moe
-                    else:
-                        predictions = local_logits
-                        loss = criterion(predictions, y)
+
+                if use_experts and len(val_expert_heads) > 0:
+                    local_logits = self.head(features)
+                    moe_logits = self.router.forward_moe(features, val_expert_heads, k=self.top_k_experts)
+
+                    # Hybrid loss for monitoring (comparable to training loss)
+                    loss_local = criterion(local_logits, y)
+                    loss_moe = criterion(moe_logits, y)
+                    loss = self.alpha * loss_local + (1 - self.alpha) * loss_moe
+
+                    # Accuracy based on MoE output (what inference uses)
+                    predictions = moe_logits
                 else:
-                    predictions = local_logits
+                    predictions = self.head(features)
                     loss = criterion(predictions, y)
-                
+
                 total_loss += loss.item()
                 _, predicted = predictions.max(1)
                 total += y.size(0)
