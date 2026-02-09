@@ -9,7 +9,7 @@ class DataPartitioner:
     """
     Partition dataset across clients
     """
-    def __init__(self, dataset: Dataset, num_clients: int, method: str = "label_sharding", classes_per_client: int = 2, alpha: float = 0.5, seed: int = 42):
+    def __init__(self, dataset: Dataset, num_clients: int, method: str = "label_sharding", classes_per_client: int = 2, alpha: float = 0.5, seed: int = 42, precomputed_labels: Optional[np.ndarray] = None):
         """
         Args:
             dataset: PyTorch Dataset
@@ -18,11 +18,12 @@ class DataPartitioner:
                 - label_sharding: Each client gets only specific classes
                 - dirichlet: Each client gets all classes with different proportions
                 - iid: Equal random split (baseline)
-            
+
             classes_per_client: Number of classes per client (for label_sharding)
             alpha: Dirichlet concentration parameter (for dirichlet)
                     Lower = more heterogeneous (0.1 = extreme, 0.5 = moderate, 10.0 = nearly IID)
             seed: Random seed for reproducibility
+            precomputed_labels: Pre-extracted labels array (avoids slow iteration over Subsets)
         """
         self.dataset = dataset
         self.num_clients = num_clients
@@ -34,12 +35,14 @@ class DataPartitioner:
         valid_methods = ['label_sharding', 'dirichlet', 'iid']
         if self.method not in valid_methods:
             raise ValueError(f"method must be one of {valid_methods}, got '{method}'")
-        
+
         np.random.seed(seed)
         torch.manual_seed(seed)
 
-        # Getting labels
-        if hasattr(dataset, "targets"):
+        # Getting labels (use precomputed if available for speed)
+        if precomputed_labels is not None:
+            self.labels = precomputed_labels
+        elif hasattr(dataset, "targets"):
             self.labels = np.array(dataset.targets)
         elif hasattr(dataset, "labels"):
             self.labels = np.array(dataset.labels)
@@ -302,6 +305,7 @@ def get_dataset(dataset_name: str, data_dir: str, train: bool = True) -> Dataset
 
     elif dataset_name == "mnist":
         transform = transforms.Compose([
+            transforms.Resize(32),  # Resize 28x28 to 32x32 to match SimpleCNNBody
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,))
         ])
@@ -344,39 +348,48 @@ def create_client_dataloaders(config) -> Tuple[List[DataLoader], List[DataLoader
     print(f"Train samples: {len(train_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
     
+    # Extract all labels ONCE from full dataset (fast path)
+    if hasattr(train_dataset, 'targets'):
+        all_labels = np.array(train_dataset.targets)
+    elif hasattr(train_dataset, 'labels'):
+        all_labels = np.array(train_dataset.labels)
+    else:
+        all_labels = np.array([train_dataset[i][1] for i in range(len(train_dataset))])
+
     # Split train into train/val (90/10)
     n_train = len(train_dataset)
     n_val = int(0.1 * n_train)
     indices = np.random.permutation(n_train)
     train_indices = indices[n_val:]
     val_indices = indices[:n_val]
-    
+
     actual_train_dataset = Subset(train_dataset, train_indices)
     val_dataset_full = Subset(train_dataset, val_indices)
-    
+
     print(f"Split: {len(train_indices)} train, {len(val_indices)} validation")
-    
+
     # Get partitioning parameters
     method = getattr(config.data, 'partitioning_method', 'label_sharding')
     classes_per_client = getattr(config.data, 'classes_per_client', 2)
     alpha = getattr(config.data, 'non_iid_alpha', 0.5)
-    
+
     print(f"\nPartitioning method: {method}")
     if method == 'label_sharding':
         print(f"Classes per client: {classes_per_client}")
     elif method == 'dirichlet':
         print(f"Dirichlet alpha: {alpha}")
-    
-    # Partition training data
+
+    # Partition training data using pre-extracted labels for speed
     train_partitioner = DataPartitioner(
         actual_train_dataset,
         num_clients=config.system.num_clients,
         method=method,
         classes_per_client=classes_per_client,
         alpha=alpha,
-        seed=config.system.seed
+        seed=config.system.seed,
+        precomputed_labels=all_labels[train_indices]
     )
-    
+
     # Partition validation data (same strategy)
     val_partitioner = DataPartitioner(
         val_dataset_full,
@@ -384,7 +397,8 @@ def create_client_dataloaders(config) -> Tuple[List[DataLoader], List[DataLoader
         method=method,
         classes_per_client=classes_per_client,
         alpha=alpha,
-        seed=config.system.seed + 1
+        seed=config.system.seed + 1,
+        precomputed_labels=all_labels[val_indices]
     )
     
     # Print distribution

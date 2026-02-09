@@ -297,45 +297,66 @@ class Router(nn.Module):
         """
         return trust * similarity * staleness_factor
     
-    def compute_routing_weight(
+    def compute_routing_weight_tensor(
         self,
         query_features: torch.Tensor,
         expert_id: int,
         projected_features: Optional[torch.Tensor] = None
-    ) -> float:
+    ) -> torch.Tensor:
         """
-        Computes the routing weight using metadata and per-expert learned gate
+        Computes the routing weight as a DIFFERENTIABLE tensor
 
         Gate = sigmoid(proj(features) · expert_emb_j / √hidden_dim)
         Final = gate × base_score
 
         Args:
-            query_features: Input embeddings (Input data)
+            query_features: Input embeddings (feature_dim,) or (B, feature_dim)
             expert_id: Expert ID of the expert
-            projected_features: Pre-computed feature projection to avoid redundant forward passes
+            projected_features: Pre-computed feature projection (hidden_dim,) or (B, hidden_dim)
 
         Returns:
-            Computed final score combining metadata base score and learned gate
+            Tensor routing weight (scalar or (B,)) - keeps gradient graph intact
         """
+        device = query_features.device
         metadata = self.expert_metadata[expert_id]
-        trust = metadata.trust_score
+
+        # Trust and staleness as tensors (constants, no grad needed)
+        trust = torch.tensor(metadata.trust_score, device=device, dtype=torch.float32)
+        staleness_factor = torch.tensor(self.compute_staleness_factor(expert_id), device=device, dtype=torch.float32)
+
+        # Similarity as tensor (keeps any gradients from features)
         similarity = self.compute_similarity(query_features, expert_id)
+        if not isinstance(similarity, torch.Tensor):
+            similarity = torch.tensor(similarity, device=device, dtype=torch.float32)
 
-        if isinstance(similarity, torch.Tensor):
-            similarity = similarity.item()
-
-        staleness_factor = self.compute_staleness_factor(expert_id)
-        base_score = self.compute_base_score(trust, similarity, staleness_factor)
+        # Base score: T * S * staleness (tensor multiplication)
+        base_score = trust * similarity * staleness_factor
 
         if self.use_learned_gating:
+            # Ensure we have projected features
+            is_batch = query_features.dim() == 2
             if projected_features is None:
-                projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
+                if is_batch:
+                    projected_features = self.feature_projector(query_features)  # (B, hidden_dim)
+                else:
+                    projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)  # (hidden_dim,)
 
-            expert_emb = self.expert_embeddings(
-                torch.tensor(expert_id, device=query_features.device)
-            )
-            affinity = torch.dot(projected_features, expert_emb) / math.sqrt(self.hidden_dim)
-            gate_value = torch.sigmoid(affinity).item()
+            # Get expert embedding
+            expert_idx = torch.tensor(expert_id, device=device)
+            expert_emb = self.expert_embeddings(expert_idx)  # (hidden_dim,)
+
+            # Compute affinity (scaled dot product)
+            if is_batch:
+                # Batched: (B, hidden_dim) @ (hidden_dim,) -> (B,)
+                affinity = (projected_features @ expert_emb) / math.sqrt(self.hidden_dim)
+            else:
+                # Single: (hidden_dim,) dot (hidden_dim,) -> scalar
+                affinity = torch.dot(projected_features, expert_emb) / math.sqrt(self.hidden_dim)
+
+            # Gate value (differentiable!)
+            gate_value = torch.sigmoid(affinity)
+
+            # Final score: gate * base_score (fully differentiable)
             return gate_value * base_score
 
         return base_score
@@ -347,44 +368,62 @@ class Router(nn.Module):
         k: Optional[int] = None
     ) -> Tuple[List[int], torch.Tensor]:
         """
-        Selects top-K experts from the available experts with computed routing weight for each data input
+        Selects top-K experts with DIFFERENTIABLE routing weights
+
+        This method keeps all computations as tensors to enable gradient flow
+        through the router's feature_projector and expert_embeddings.
 
         Args:
-            query_features: Input embeddings (Input data)
+            query_features: Input embeddings (feature_dim,) - single sample
             available_experts: Experts that could be used for selection
             k: Number of experts to use
 
         Returns:
-            (selected_expert_ids, normalized_weights)
+            (selected_expert_ids, normalized_weights) where weights are differentiable
         """
         if k is None:
             k = self.top_k
         if available_experts is None:
             available_experts = list(range(self.num_experts))
 
+        device = query_features.device
+
         # Pre-compute feature projection once (shared across all experts)
-        # Note: No torch.no_grad() here to allow gradient flow for router learning
+        # This is the key differentiable computation for router learning
         projected_features = None
         if self.use_learned_gating:
             projected_features = self.feature_projector(query_features.unsqueeze(0)).squeeze(0)
 
-        scores = []
+        # Compute scores as tensors (maintain gradient graph)
+        score_tensors = []
         valid_expert_ids = []
 
         for expert_id in available_experts:
             if self.expert_features_count[expert_id] > 0:
-                score = self.compute_routing_weight(query_features, expert_id, projected_features=projected_features)
-                scores.append(score)
+                # Returns a tensor, preserving gradients!
+                score = self.compute_routing_weight_tensor(
+                    query_features, expert_id, projected_features=projected_features
+                )
+                score_tensors.append(score)
                 valid_expert_ids.append(expert_id)
 
-        if len(scores) == 0:
-            return [], torch.tensor([])
+        if len(score_tensors) == 0:
+            return [], torch.tensor([], device=device)
 
-        scores = torch.tensor(scores, device=query_features.device)
+        # Stack scores into a single tensor (keeps gradient graph!)
+        scores = torch.stack(score_tensors)  # (num_valid_experts,)
+
         k = min(k, len(scores))
+
+        # Top-k selection (indices are non-differentiable, but scores are)
         top_k_scores, top_k_indices = torch.topk(scores, k)
+
+        # Normalize weights with softmax (differentiable!)
         normalized_weights = F.softmax(top_k_scores / self.temperature, dim=0)
-        selected_ids = [valid_expert_ids[i] for i in top_k_indices]
+
+        # Get expert IDs (non-differentiable, but that's fine - routing decision)
+        selected_ids = [valid_expert_ids[idx.item()] for idx in top_k_indices]
+
         return selected_ids, normalized_weights
     
     def forward_moe(

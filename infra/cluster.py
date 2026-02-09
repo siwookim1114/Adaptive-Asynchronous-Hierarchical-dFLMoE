@@ -78,6 +78,7 @@ class Cluster:
 
     def remove_member(self, client_id: str):
         """Remove client from cluster"""
+        self.member_ids.discard(client_id)
         if self.cluster_head_id == client_id:
             self.cluster_head_id = None
         self.last_updated = time.time()

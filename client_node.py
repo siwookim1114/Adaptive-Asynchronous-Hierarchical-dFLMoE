@@ -57,7 +57,7 @@ class ClientNode:
         self.lr_router = learning_rate_router
         
         # Components
-        self.cache = PeerCache(max_cache_size=max_cache_size, staleness_lambda=staleness_lambda)
+        self.cache = PeerCache(max_cache_size=max_cache_size, staleness_decay=staleness_lambda)
         self.transport = TCPTransport(client_id=client_id, host=host, port=port)
         self.cluster_manager = cluster_manager
         self.router = Router(
@@ -114,7 +114,11 @@ class ClientNode:
     def set_model(self, body_encoder: nn.Module, head: nn.Module):
         self.body_encoder = body_encoder
         self.head = head
-        
+
+        # Move router to same device as body encoder
+        device = next(body_encoder.parameters()).device
+        self.router = self.router.to(device)
+
         self.optimizer_head = optim.Adam(self.head.parameters(), lr=self.lr_head)
         self.optimizer_body = optim.Adam(self.body_encoder.parameters(), lr=self.lr_body)
         self.optimizer_router = optim.Adam(self.router.parameters(), lr=self.lr_router)
@@ -280,8 +284,7 @@ class ClientNode:
         
         for x, y in data_loader:
             x, y = x.to(device), y.to(device)
-            self.router = self.router.to(device)
-            
+
             features = self.body_encoder(x)
             local_logits = self.head(features)
             loss_local = criterion(local_logits, y)
@@ -297,28 +300,27 @@ class ClientNode:
                         head_temp.load_state_dict(pkg.head_state_dict)
                         head_temp = head_temp.to(device)
                         expert_heads[eid] = head_temp
-                    
+
                     expert_logits = self.router.forward_moe(features, expert_heads, k=self.top_k_experts)
                     loss_moe = criterion(expert_logits, y)
                     loss_full = self.alpha * loss_local + (1 - self.alpha) * loss_moe
-                    
-                    # Gradient routing
+
+                    # Single backward pass for correct gradient routing
+                    # L_full = alpha * L_local + (1-alpha) * L_moe
+                    # Gradients flow naturally:
+                    # - Head: receives alpha * grad_local (from L_local term)
+                    # - Router/FST: receives (1-alpha) * grad_moe (from L_moe term)
+                    # - Body: receives both (from both terms via features)
                     self.optimizer_head.zero_grad()
                     self.optimizer_body.zero_grad()
                     self.optimizer_router.zero_grad()
-                    
-                    loss_local.backward(retain_graph=True)
-                    self.optimizer_head.step()
-                    
-                    self.optimizer_router.zero_grad()
-                    self.optimizer_body.zero_grad()
-                    loss_moe.backward(retain_graph=True)
-                    self.optimizer_router.step()
-                    
-                    self.optimizer_body.zero_grad()
+
                     loss_full.backward()
+
+                    self.optimizer_head.step()
                     self.optimizer_body.step()
-                    
+                    self.optimizer_router.step()
+
                     experts_used_count += len(expert_packages)
                     predictions = self.alpha * local_logits + (1 - self.alpha) * expert_logits
                 else:
