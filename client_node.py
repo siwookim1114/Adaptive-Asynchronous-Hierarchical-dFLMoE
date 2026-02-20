@@ -45,7 +45,9 @@ class ClientNode:
         local_epochs: int = 5,
         learning_rate_head: float = 0.001,
         learning_rate_body: float = 0.001,
-        learning_rate_router: float = 0.001
+        learning_rate_router: float = 0.001,
+        weight_decay: float = 1e-4,
+        lr_decay: float = 0.98
     ):
         self.client_id = client_id
         self.local_expert_id = int(client_id.split('_')[-1]) if '_' in client_id else int(client_id)
@@ -60,6 +62,9 @@ class ClientNode:
         self.lr_router = learning_rate_router
         self.warmup_rounds = warmup_rounds
         self.local_epochs = local_epochs
+        self.weight_decay = weight_decay
+        self.lr_decay = lr_decay
+        self.dropout = 0.0  # Set by main.py via head creation; stored for eval
         
         # Components
         self.cache = PeerCache(max_cache_size=max_cache_size, staleness_decay=staleness_lambda)
@@ -134,21 +139,27 @@ class ClientNode:
             if key not in self._registered_fst_keys:
                 self.optimizer_router.add_param_group({
                     'params': list(fst.parameters()),
-                    'lr': self.lr_router
+                    'lr': self.lr_router,
+                    'weight_decay': self.weight_decay
                 })
                 self._registered_fst_keys.add(key)
 
     def set_model(self, body_encoder: nn.Module, head: nn.Module):
         self.body_encoder = body_encoder
         self.head = head
+        # Store dropout from head for use when creating temp heads in evaluation
+        if hasattr(head, 'layers') and len(head.layers) > 2:
+            dropout_layer = head.layers[2]
+            if isinstance(dropout_layer, nn.Dropout):
+                self.dropout = dropout_layer.p
 
         # Move router to same device as body encoder
         device = next(body_encoder.parameters()).device
         self.router = self.router.to(device)
 
-        self.optimizer_head = optim.Adam(self.head.parameters(), lr=self.lr_head)
-        self.optimizer_body = optim.Adam(self.body_encoder.parameters(), lr=self.lr_body)
-        self.optimizer_router = optim.Adam(self.router.parameters(), lr=self.lr_router)
+        self.optimizer_head = optim.Adam(self.head.parameters(), lr=self.lr_head, weight_decay=self.weight_decay)
+        self.optimizer_body = optim.Adam(self.body_encoder.parameters(), lr=self.lr_body, weight_decay=self.weight_decay)
+        self.optimizer_router = optim.Adam(self.router.parameters(), lr=self.lr_router, weight_decay=self.weight_decay)
 
         # Register local head as expert so router can score it
         self._register_local_expert()
@@ -187,8 +198,10 @@ class ClientNode:
                     num_samples=package.num_samples,
                     timestamp=package.timestamp
                 )
-                # Add newly created FST params to optimizer
-                self._ensure_fsts_in_optimizer()
+                # NOTE: FST params are added to optimizer at the start of
+                # _train_epoch_corrected(), NOT here. This handler runs in the
+                # transport thread — calling optimizer methods here would race
+                # with the training thread.
 
                 with self._stats_lock:
                     self._stats['experts_registered'] += 1
@@ -314,10 +327,16 @@ class ClientNode:
         # to avoid excessive re-clustering (previously triggered per-client per-round)
 
         self.share_expert()
-        
+
+        # LR decay: reduce learning rates each round to stabilize later training
+        if self.lr_decay < 1.0:
+            for optimizer in [self.optimizer_head, self.optimizer_body, self.optimizer_router]:
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= self.lr_decay
+
         with self._stats_lock:
             self._stats['rounds_completed'] += 1
-        
+
         return {
             'round': self.current_round,
             'train_loss': train_metrics['loss_total'],
@@ -360,7 +379,7 @@ class ClientNode:
             expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
             for pkg in expert_packages:
                 eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes, dropout=self.dropout)
                 head_temp.load_state_dict(pkg.head_state_dict)
                 head_temp = head_temp.to(device)
                 head_temp.eval()
@@ -371,7 +390,7 @@ class ClientNode:
         # with L_local gradients on the same head, degrading training.
         # The copy is treated identically to remote expert heads.
         if use_experts:
-            local_head_copy = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+            local_head_copy = Head(input_dim=self.feature_dim, output_dim=self.num_classes, dropout=self.dropout)
             local_head_copy.load_state_dict(self.head.state_dict())
             local_head_copy = local_head_copy.to(device)
             local_head_copy.eval()
@@ -472,7 +491,7 @@ class ClientNode:
             expert_packages = self.cache.get_available_experts(exclude_id=self.client_id)
             for pkg in expert_packages:
                 eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+                head_temp = Head(input_dim=self.feature_dim, output_dim=self.num_classes, dropout=self.dropout)
                 head_temp.load_state_dict(pkg.head_state_dict)
                 head_temp = head_temp.to(device)
                 head_temp.eval()

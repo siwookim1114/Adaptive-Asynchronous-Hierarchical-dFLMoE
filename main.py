@@ -17,6 +17,7 @@ import torchvision.transforms as transforms
 import time
 import threading
 import argparse
+import concurrent.futures
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
@@ -51,7 +52,10 @@ def parse_args():
     parser.add_argument('--lr_head', type=float, default=0.001, help='Learning rate for head')
     parser.add_argument('--lr_body', type=float, default=0.001, help='Learning rate for body')
     parser.add_argument('--lr_router', type=float, default=0.001, help='Learning rate for router')
-    
+    parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for regularization')
+    parser.add_argument('--lr_decay', type=float, default=0.98, help='LR decay factor per round')
+    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout in expert heads')
+
     # Data settings
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'mnist'], help='Dataset')
     parser.add_argument('--partition_method', type=str, default='dirichlet',
@@ -201,7 +205,7 @@ def create_data_loaders(
     return train_loaders, val_loaders, test_loader, partitioner
 
 
-def create_models(feature_dim: int, num_classes: int, device: torch.device, dataset: str = 'cifar10'):
+def create_models(feature_dim: int, num_classes: int, device: torch.device, dataset: str = 'cifar10', dropout: float = 0.0):
     """
     Create body encoder and head
 
@@ -210,13 +214,14 @@ def create_models(feature_dim: int, num_classes: int, device: torch.device, data
         num_classes: Number of classes
         device: Device
         dataset: Dataset name (determines input channels)
+        dropout: Dropout probability for head
 
     Returns:
         (body_encoder, head)
     """
     input_channels = 1 if dataset == 'mnist' else 3
     body_encoder = SimpleCNNBody(input_channels=input_channels, output_dim=feature_dim).to(device)
-    head = Head(input_dim=feature_dim, output_dim=num_classes).to(device)
+    head = Head(input_dim=feature_dim, output_dim=num_classes, dropout=dropout).to(device)
 
     return body_encoder, head
 
@@ -243,6 +248,9 @@ def run_federated_learning(args):
     print(f"Warmup rounds: {args.warmup_rounds}")
     print(f"Local epochs: {args.local_epochs}")
     print(f"Top-K experts: {args.top_k_experts}")
+    print(f"Weight decay: {args.weight_decay}")
+    print(f"LR decay: {args.lr_decay}")
+    print(f"Dropout: {args.dropout}")
     print(f"Partition method: {args.partition_method}")
     if args.partition_method == 'dirichlet':
         print(f"Dirichlet alpha: {args.non_iid_alpha}")
@@ -301,11 +309,13 @@ def run_federated_learning(args):
             local_epochs=args.local_epochs,
             learning_rate_head=args.lr_head,
             learning_rate_body=args.lr_body,
-            learning_rate_router=args.lr_router
+            learning_rate_router=args.lr_router,
+            weight_decay=args.weight_decay,
+            lr_decay=args.lr_decay
         )
         
         # Create models for this client
-        body_encoder, head = create_models(args.feature_dim, args.num_classes, device, args.dataset)
+        body_encoder, head = create_models(args.feature_dim, args.num_classes, device, args.dataset, args.dropout)
         client.set_model(body_encoder, head)
         
         clients.append(client)
@@ -362,33 +372,45 @@ def run_federated_learning(args):
         
         round_start_time = time.time()
         
-        # Train each client
+        # Train all clients concurrently (asynchronous federated learning)
+        # Each client trains in its own thread. While clients train, expert
+        # packages from other clients can arrive via transport handlers,
+        # enabling true asynchronous expert exchange.
         round_metrics = []
-        
-        for i, client in enumerate(clients):
+
+        def train_one_client(idx, client, train_loader, val_loader):
+            """Train a single client in a thread."""
             try:
                 metrics = client.train_round(
-                    train_loader=train_loaders[i],
-                    val_loader=val_loaders[i],
+                    train_loader=train_loader,
+                    val_loader=val_loader,
                     criterion=criterion,
                     device=device,
                     use_experts=True
                 )
-                
-                round_metrics.append(metrics)
-                
-                if args.verbose or i == 0:
-                    print(f"Client {i}: "
-                          f"Train Loss={metrics['train_loss']:.4f}, "
-                          f"Train Acc={metrics['train_acc']:.3f}, "
-                          f"Val Acc={metrics['val_acc']:.3f}, "
-                          f"Trust={metrics['trust_score']:.3f}, "
-                          f"Cache={metrics['cache_size']}, "
-                          f"Experts Used={metrics['experts_used']}")
-            
+                return idx, metrics, None
             except Exception as e:
-                print(f"  Client {i} error: {e}")
-                continue
+                return idx, None, e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_clients) as executor:
+            futures = [
+                executor.submit(train_one_client, i, client, train_loaders[i], val_loaders[i])
+                for i, client in enumerate(clients)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                idx, metrics, error = future.result()
+                if error:
+                    print(f"  Client {idx} error: {error}")
+                elif metrics:
+                    round_metrics.append(metrics)
+                    if args.verbose or idx == 0:
+                        print(f"Client {idx}: "
+                              f"Train Loss={metrics['train_loss']:.4f}, "
+                              f"Train Acc={metrics['train_acc']:.3f}, "
+                              f"Val Acc={metrics['val_acc']:.3f}, "
+                              f"Trust={metrics['trust_score']:.3f}, "
+                              f"Cache={metrics['cache_size']}, "
+                              f"Experts Used={metrics['experts_used']}")
         
         # Re-cluster every 5 rounds (after real features are computed)
         # Round 1: first recluster with real features (initial was random)
@@ -531,7 +553,7 @@ def evaluate_global(
             expert_packages = client.cache.get_available_experts(exclude_id=client.client_id)
             for pkg in expert_packages:
                 eid = int(pkg.client_id.split('_')[-1]) if '_' in pkg.client_id else int(pkg.client_id)
-                head_temp = Head(input_dim=client.feature_dim, output_dim=client.num_classes)
+                head_temp = Head(input_dim=client.feature_dim, output_dim=client.num_classes, dropout=client.dropout)
                 head_temp.load_state_dict(pkg.head_state_dict)
                 head_temp = head_temp.to(device)
                 head_temp.eval()
@@ -620,6 +642,9 @@ def save_results(args, global_stats):
         f.write(f"  LR Head:            {args.lr_head}\n")
         f.write(f"  LR Body:            {args.lr_body}\n")
         f.write(f"  LR Router:          {args.lr_router}\n")
+        f.write(f"  Weight Decay:       {args.weight_decay}\n")
+        f.write(f"  LR Decay:           {args.lr_decay}\n")
+        f.write(f"  Dropout:            {args.dropout}\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")
         f.write(f"  Seed:               {args.seed}\n")
         f.write(f"  Device:             {args.device}\n\n")

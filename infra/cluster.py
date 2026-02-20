@@ -271,6 +271,11 @@ class ClusterManager:
             # Stack into matrix: (num_clients, feature_dim)
             features_matrix = np.vstack(features_list)
 
+            # L2-normalize features so K-Means uses cosine-like distance
+            # Without this, Euclidean K-Means in 512-d is dominated by magnitude
+            norms = np.linalg.norm(features_matrix, axis=1, keepdims=True)
+            features_matrix = features_matrix / np.maximum(norms, 1e-8)
+
             # Determine actual number of clusters
             actual_num_clusters = min(self.num_clusters, len(self.clients))
             actual_num_clusters = max(1, actual_num_clusters)     # Make sure we have atleast 1 cluster
