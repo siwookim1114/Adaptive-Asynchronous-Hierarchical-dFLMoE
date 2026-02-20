@@ -45,6 +45,8 @@ def parse_args():
     
     # Training settings
     parser.add_argument('--alpha', type=float, default=0.6, help='Hybrid loss weight (local)')
+    parser.add_argument('--warmup_rounds', type=int, default=10, help='Rounds for alpha warm-up (1.0 to target alpha)')
+    parser.add_argument('--local_epochs', type=int, default=5, help='Local training epochs per round')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--lr_head', type=float, default=0.001, help='Learning rate for head')
     parser.add_argument('--lr_body', type=float, default=0.001, help='Learning rate for body')
@@ -238,6 +240,8 @@ def run_federated_learning(args):
     print(f"Number of clusters: {args.num_clusters}")
     print(f"Training rounds: {args.rounds}")
     print(f"Alpha (local weight): {args.alpha}")
+    print(f"Warmup rounds: {args.warmup_rounds}")
+    print(f"Local epochs: {args.local_epochs}")
     print(f"Top-K experts: {args.top_k_experts}")
     print(f"Partition method: {args.partition_method}")
     if args.partition_method == 'dirichlet':
@@ -293,6 +297,8 @@ def run_federated_learning(args):
             staleness_lambda=0.001,
             top_k_experts=args.top_k_experts,
             alpha=args.alpha,
+            warmup_rounds=args.warmup_rounds,
+            local_epochs=args.local_epochs,
             learning_rate_head=args.lr_head,
             learning_rate_body=args.lr_body,
             learning_rate_router=args.lr_router
@@ -425,6 +431,8 @@ def run_federated_learning(args):
             print(f"Average Val Loss:       {avg_val_loss:.4f}")
             print(f"Average Val Acc:        {avg_val_acc:.3f}")
             print(f"Avg Experts Used:   {avg_experts_used:.1f}")
+            if 'current_alpha' in round_metrics[0]:
+                print(f"Current Alpha:      {round_metrics[0]['current_alpha']:.3f}")
             if test_acc is not None:
                 print(f"Global Test Acc:    {test_acc:.3f}")
             print(f"Round Time:         {round_time:.2f}s")
@@ -605,6 +613,8 @@ def save_results(args, global_stats):
         elif args.partition_method == 'label_sharding':
             f.write(f"  Classes/Client:     {args.classes_per_client}\n")
         f.write(f"  Alpha (local wt):   {args.alpha}\n")
+        f.write(f"  Warmup Rounds:      {args.warmup_rounds}\n")
+        f.write(f"  Local Epochs:       {args.local_epochs}\n")
         f.write(f"  Top-K Experts:      {args.top_k_experts}\n")
         f.write(f"  Batch Size:         {args.batch_size}\n")
         f.write(f"  LR Head:            {args.lr_head}\n")

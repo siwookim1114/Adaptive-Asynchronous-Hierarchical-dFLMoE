@@ -361,6 +361,54 @@ class Router(nn.Module):
 
         return base_score
     
+    def _compute_scores_batched(
+        self,
+        features: torch.Tensor,
+        valid_experts: List[int]
+    ) -> torch.Tensor:
+        """Compute routing scores for all samples x all experts at once.
+
+        Returns a (B, num_valid) tensor of differentiable routing scores.
+        The feature projection is computed once and shared across all experts.
+
+        Args:
+            features: (B, feature_dim)
+            valid_experts: List of expert IDs
+
+        Returns:
+            (B, num_valid) tensor of routing scores
+        """
+        device = features.device
+
+        # Project features once (shared across all experts)
+        projected = None
+        if self.use_learned_gating:
+            projected = self.feature_projector(features)  # (B, hidden_dim)
+
+        score_list = []
+        for eid in valid_experts:
+            metadata = self.expert_metadata[eid]
+            trust = metadata.trust_score
+            staleness = self.compute_staleness_factor(eid)
+
+            # Similarity: (B,)
+            similarity = self.compute_similarity(features, eid)
+            if not isinstance(similarity, torch.Tensor):
+                similarity = torch.tensor(similarity, device=device, dtype=torch.float32)
+
+            base_score = trust * similarity * staleness  # (B,)
+
+            if self.use_learned_gating and projected is not None:
+                expert_idx = torch.tensor(eid, device=device)
+                expert_emb = self.expert_embeddings(expert_idx)  # (hidden_dim,)
+                affinity = (projected @ expert_emb) / math.sqrt(self.hidden_dim)  # (B,)
+                gate = torch.sigmoid(affinity)  # (B,)
+                score_list.append(gate * base_score)
+            else:
+                score_list.append(base_score)
+
+        return torch.stack(score_list, dim=1)  # (B, num_valid)
+
     def select_top_k_experts(
         self,
         query_features: torch.Tensor,
@@ -433,48 +481,61 @@ class Router(nn.Module):
         available_experts: Optional[List[int]] = None,
         k: Optional[int] = None
     ) -> torch.Tensor:
-        """MoE Forward Passes with FST integrated"""
+        """Batched MoE forward pass with FST integration.
+
+        Computes all expert outputs in batched mode (one batched forward per
+        expert) instead of per-sample loops.  This is roughly
+        (batch_size * K / num_experts) times faster.
+
+        Gradient flow is preserved:
+        - Router params (feature_projector, expert_embeddings) get gradients
+          through the gating scores and softmax weights.
+        - FST params get gradients through the expert output computation.
+        - Top-K selection is non-differentiable (discrete), but the selected
+          scores and outputs maintain their gradient graphs.
+        """
         batch_size = features.size(0)
         device = features.device
-        outputs = torch.zeros(batch_size, self.num_classes, device=device)
 
         if len(expert_heads) == 0:
-            return outputs
+            return torch.zeros(batch_size, self.num_classes, device=device)
 
-        # Filter to only experts that have heads available (prevents weight loss from skipping)
+        # Filter to experts with available heads AND registered features
         if available_experts is None:
-            valid_experts = list(expert_heads.keys())
+            valid_experts = [eid for eid in expert_heads.keys()
+                            if self.expert_features_count[eid] > 0]
         else:
-            valid_experts = [eid for eid in available_experts if eid in expert_heads]
+            valid_experts = [eid for eid in available_experts
+                            if eid in expert_heads and self.expert_features_count[eid] > 0]
 
         if len(valid_experts) == 0:
-            return outputs
+            return torch.zeros(batch_size, self.num_classes, device=device)
 
-        for i in range(batch_size):
-            query_features = features[i]
-            selected_ids, weights = self.select_top_k_experts(query_features, valid_experts, k)
+        effective_k = min(k or self.top_k, len(valid_experts))
 
-            if len(selected_ids) == 0:
-                continue
+        # Step 1: Compute ALL expert outputs for the entire batch (batched per expert)
+        expert_output_list = []
+        for eid in valid_experts:
+            fst = self.get_or_create_fst(eid).to(device)
+            aligned = fst(features)                    # (B, feature_dim)
+            logits = expert_heads[eid](aligned)        # (B, num_classes)
+            expert_output_list.append(logits)
+        # (B, num_valid, num_classes)
+        expert_outputs = torch.stack(expert_output_list, dim=1)
 
-            sample_output = torch.zeros(self.num_classes, device=device)
+        # Step 2: Compute routing scores for all samples x all experts
+        scores = self._compute_scores_batched(features, valid_experts)  # (B, num_valid)
 
-            for expert_id, weight in zip(selected_ids, weights):
-                fst = self.get_or_create_fst(expert_id)
-                fst = fst.to(device)
-                aligned_features = fst(query_features.unsqueeze(0))
+        # Step 3: Top-K selection and softmax normalization
+        top_scores, top_indices = torch.topk(scores, effective_k, dim=1)  # (B, K)
+        top_weights = F.softmax(top_scores / self.temperature, dim=1)     # (B, K)
 
-                expert_head = expert_heads[expert_id]
-                # Note: Caller is responsible for setting eval/train mode.
-                # Cached heads are already in eval mode; the local head stays
-                # in whatever mode the caller set (train during training).
-                # Cached head params have no optimizer (frozen). The local head
-                # IS in an optimizer, so L_moe gradients provide extra training signal.
-                expert_logits = expert_head(aligned_features).squeeze(0)
+        # Step 4: Gather top-K expert outputs and weighted combine
+        idx_expanded = top_indices.unsqueeze(-1).expand(-1, -1, self.num_classes)  # (B, K, C)
+        selected = torch.gather(expert_outputs, 1, idx_expanded)                  # (B, K, C)
 
-                sample_output += weight * expert_logits
-            outputs[i] = sample_output
-        return outputs
+        # Weighted sum: (B, K, C) * (B, K, 1) -> sum dim=1 -> (B, C)
+        return (selected * top_weights.unsqueeze(-1)).sum(dim=1)
     
     def get_expert_status(self, expert_id: int) -> Dict:
         if expert_id not in self.expert_metadata:

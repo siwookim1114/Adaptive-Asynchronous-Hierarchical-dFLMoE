@@ -41,6 +41,8 @@ class ClientNode:
         staleness_lambda: float = 0.001,
         top_k_experts: int = 3,
         alpha: float = 0.5,
+        warmup_rounds: int = 10,
+        local_epochs: int = 5,
         learning_rate_head: float = 0.001,
         learning_rate_body: float = 0.001,
         learning_rate_router: float = 0.001
@@ -56,6 +58,8 @@ class ClientNode:
         self.lr_head = learning_rate_head
         self.lr_body = learning_rate_body
         self.lr_router = learning_rate_router
+        self.warmup_rounds = warmup_rounds
+        self.local_epochs = local_epochs
         
         # Components
         self.cache = PeerCache(max_cache_size=max_cache_size, staleness_decay=staleness_lambda)
@@ -90,6 +94,10 @@ class ClientNode:
         self.cross_cluster_exchange_interval = 5
         self.current_round = 0
         
+        # Track which FST keys have been added to optimizer_router
+        # (FSTs created after optimizer init must be explicitly added)
+        self._registered_fst_keys = set()
+
         # Statistics
         self._stats = {
             'rounds_completed': 0,
@@ -112,6 +120,24 @@ class ClientNode:
             trust_score=self.trust_score
         )
     
+    def _ensure_fsts_in_optimizer(self):
+        """Add any newly created FST parameters to the router optimizer.
+
+        FSTs are created lazily by router.get_or_create_fst() when experts
+        register. Since the optimizer is created before any FSTs exist,
+        new FST parameters must be explicitly added via add_param_group.
+        Without this, FSTs stay at identity init and never learn.
+        """
+        if self.optimizer_router is None:
+            return
+        for key, fst in self.router.fst_transforms.items():
+            if key not in self._registered_fst_keys:
+                self.optimizer_router.add_param_group({
+                    'params': list(fst.parameters()),
+                    'lr': self.lr_router
+                })
+                self._registered_fst_keys.add(key)
+
     def set_model(self, body_encoder: nn.Module, head: nn.Module):
         self.body_encoder = body_encoder
         self.head = head
@@ -126,6 +152,8 @@ class ClientNode:
 
         # Register local head as expert so router can score it
         self._register_local_expert()
+        # Add the local expert's FST (just created) to the optimizer
+        self._ensure_fsts_in_optimizer()
 
     def _register_local_expert(self):
         """Register this client's own head as an expert in the router.
@@ -159,7 +187,9 @@ class ClientNode:
                     num_samples=package.num_samples,
                     timestamp=package.timestamp
                 )
-                
+                # Add newly created FST params to optimizer
+                self._ensure_fsts_in_optimizer()
+
                 with self._stats_lock:
                     self._stats['experts_registered'] += 1
             except Exception as e:
@@ -201,6 +231,18 @@ class ClientNode:
         with self._stats_lock:
             self._stats['trust_updates'] += 1
     
+    def _get_current_alpha(self) -> float:
+        """Adaptive alpha with warm-up schedule.
+
+        Linearly decays from 1.0 (pure local) to target alpha over
+        warmup_rounds. This lets body/head stabilize before MoE
+        contributes significant gradient signal.
+        """
+        if self.warmup_rounds <= 0 or self.current_round >= self.warmup_rounds:
+            return self.alpha
+        progress = self.current_round / self.warmup_rounds
+        return 1.0 - (1.0 - self.alpha) * progress
+
     def create_expert_package(self) -> ExpertPackage:
         if self.head is None:
             raise ValueError("Head not set")
@@ -248,8 +290,12 @@ class ClientNode:
             raise ValueError("Model not set")
         
         self.current_round += 1
-        
-        train_metrics = self._train_epoch_corrected(train_loader, criterion, device, use_experts)
+
+        # Multiple local epochs per round for better body/head convergence.
+        # Each epoch creates a fresh frozen copy of the head for the MoE pool.
+        for _epoch in range(self.local_epochs):
+            train_metrics = self._train_epoch_corrected(train_loader, criterion, device, use_experts)
+
         val_loss, val_acc = self._validate(val_loader, criterion, device, use_experts)
         
         self.compute_trust_score(val_acc, len(train_loader.dataset))
@@ -282,7 +328,8 @@ class ClientNode:
             'val_acc': val_acc,
             'trust_score': self.trust_score,
             'cache_size': self.cache.size(),
-            'experts_used': train_metrics['experts_used']
+            'experts_used': train_metrics['experts_used'],
+            'current_alpha': self._get_current_alpha()
         }
     
     def _train_epoch_corrected(
@@ -293,6 +340,9 @@ class ClientNode:
         use_experts: bool
     ) -> Dict:
         """Training with hybrid loss and gradient routing"""
+        # Ensure any FSTs created since last epoch are in the optimizer
+        self._ensure_fsts_in_optimizer()
+
         self.body_encoder.train()
         self.head.train()
         self.router.train()
@@ -316,10 +366,16 @@ class ClientNode:
                 head_temp.eval()
                 expert_heads[eid] = head_temp
 
-        # Include local head in expert pool — router scores it alongside
-        # remote experts using Trust x Similarity x Staleness x Gate
+        # Include a FROZEN COPY of local head in MoE expert pool.
+        # Using the live self.head would cause L_moe gradients to conflict
+        # with L_local gradients on the same head, degrading training.
+        # The copy is treated identically to remote expert heads.
         if use_experts:
-            expert_heads[self.local_expert_id] = self.head
+            local_head_copy = Head(input_dim=self.feature_dim, output_dim=self.num_classes)
+            local_head_copy.load_state_dict(self.head.state_dict())
+            local_head_copy = local_head_copy.to(device)
+            local_head_copy.eval()
+            expert_heads[self.local_expert_id] = local_head_copy
 
         for x, y in data_loader:
             x, y = x.to(device), y.to(device)
@@ -334,10 +390,11 @@ class ClientNode:
                 moe_logits = self.router.forward_moe(features.detach(), expert_heads, k=self.top_k_experts)
                 loss_moe = criterion(moe_logits, y)
 
-                # α controls gradient balance only:
-                # L_local trains body+head (via features WITH gradients)
-                # L_moe trains router+FST+selected heads (via features.detach())
-                loss_full = self.alpha * loss_local + (1 - self.alpha) * loss_moe
+                # Adaptive α with warm-up: starts high (≈1.0) for stable
+                # body/head training, decays to target as features mature.
+                # L_local trains body+head, L_moe trains router+FST.
+                current_alpha = self._get_current_alpha()
+                loss_full = current_alpha * loss_local + (1 - current_alpha) * loss_moe
 
                 self.optimizer_head.zero_grad()
                 self.optimizer_body.zero_grad()
@@ -437,7 +494,8 @@ class ClientNode:
                     # Hybrid loss for monitoring (comparable to training loss)
                     loss_local = criterion(local_logits, y)
                     loss_moe = criterion(moe_logits, y)
-                    loss = self.alpha * loss_local + (1 - self.alpha) * loss_moe
+                    current_alpha = self._get_current_alpha()
+                    loss = current_alpha * loss_local + (1 - current_alpha) * loss_moe
 
                     # Accuracy based on MoE output (what inference uses)
                     predictions = moe_logits
