@@ -15,6 +15,7 @@ import torchvision
 import torchvision.transforms as transforms
 
 import time
+import math
 import threading
 import argparse
 import concurrent.futures
@@ -55,6 +56,12 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for regularization')
     parser.add_argument('--lr_decay', type=float, default=0.98, help='LR decay factor per round')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout in expert heads')
+
+    # Ensemble evaluation settings
+    parser.add_argument('--ensemble_temp', type=float, default=2.0,
+                        help='Temperature for ensemble softmax calibration (higher=softer predictions)')
+    parser.add_argument('--entropy_threshold', type=float, default=0.6,
+                        help='Max normalized entropy to include client in ensemble (0-1, lower=stricter)')
 
     # Data settings
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'mnist'], help='Dataset')
@@ -251,6 +258,8 @@ def run_federated_learning(args):
     print(f"Weight decay: {args.weight_decay}")
     print(f"LR decay: {args.lr_decay}")
     print(f"Dropout: {args.dropout}")
+    print(f"Ensemble Temp: {args.ensemble_temp}")
+    print(f"Entropy Threshold: {args.entropy_threshold}")
     print(f"Partition method: {args.partition_method}")
     if args.partition_method == 'dirichlet':
         print(f"Dirichlet alpha: {args.non_iid_alpha}")
@@ -362,8 +371,11 @@ def run_federated_learning(args):
         'val_loss': [],
         'val_acc': [],
         'test_acc': [],
-        'avg_experts_used': []
+        'avg_experts_used': [],
+        'round_time': []
     }
+
+    training_start_time = time.time()
     
     for round_num in range(1, args.rounds + 1):
         print(f"\n{'='*70}")
@@ -429,7 +441,9 @@ def run_federated_learning(args):
             
             # Global test every 5 rounds (and always on last round)
             if round_num % 5 == 0 or round_num == args.rounds:
-                test_acc = evaluate_global(clients, test_loader, device)
+                test_acc = evaluate_global(clients, test_loader, device,
+                                           ensemble_temp=args.ensemble_temp,
+                                           entropy_threshold=args.entropy_threshold)
                 global_stats['test_acc'].append(test_acc)
             else:
                 test_acc = None
@@ -441,8 +455,9 @@ def run_federated_learning(args):
             global_stats['val_loss'].append(avg_val_loss)
             global_stats['val_acc'].append(avg_val_acc)
             global_stats['avg_experts_used'].append(avg_experts_used)
-            
+
             round_time = time.time() - round_start_time
+            global_stats['round_time'].append(round_time)
             
             # Print round summary
             print(f"\n{'='*70}")
@@ -465,9 +480,14 @@ def run_federated_learning(args):
     print("FINAL EVALUATION")
     print("="*70 + "\n")
 
-    final_test_acc = evaluate_global(clients, test_loader, device)
+    final_test_acc = evaluate_global(clients, test_loader, device,
+                                     ensemble_temp=args.ensemble_temp,
+                                     entropy_threshold=args.entropy_threshold)
     global_stats['final_test_acc'] = final_test_acc
-    print(f"Final Global Test Accuracy: {final_test_acc:.3f}\n")
+    total_training_time = time.time() - training_start_time
+    global_stats['total_training_time'] = total_training_time
+    print(f"Final Global Test Accuracy: {final_test_acc:.3f}")
+    print(f"Total Training Time: {total_training_time:.2f}s ({total_training_time/60:.1f}min)\n")
 
     # Collect per-client final statistics
     client_final_stats = []
@@ -479,6 +499,7 @@ def run_federated_learning(args):
             'rounds_completed': stats['rounds_completed'],
             'experts_sent': stats['experts_sent'],
             'experts_received': stats['experts_received'],
+            'experts_relayed': stats['experts_relayed'],
             'experts_registered': stats['experts_registered'],
             'experts_used': stats['experts_used'],
             'trust_score': client.trust_score,
@@ -491,6 +512,7 @@ def run_federated_learning(args):
         print(f"  Rounds: {stats['rounds_completed']}")
         print(f"  Experts Sent: {stats['experts_sent']}")
         print(f"  Experts Received: {stats['experts_received']}")
+        print(f"  Experts Relayed: {stats['experts_relayed']}")
         print(f"  Experts Registered: {stats['experts_registered']}")
         print(f"  Experts Used: {stats['experts_used']}")
         print(f"  Trust Score: {client.trust_score:.3f}")
@@ -568,8 +590,12 @@ def evaluate_global(
         for x, y in test_loader:
             x, y = x.to(device), y.to(device)
 
+            # Per-sample confidence-weighted ensemble:
+            # Clients uncertain about a sample (poor body encoder features for
+            # that class) produce near-uniform softmax → low confidence → low
+            # weight. Clients confident about a sample dominate the ensemble.
             ensemble_probs = torch.zeros(x.size(0), num_classes, device=device)
-            total_weight = 0.0
+            total_weight = torch.zeros(x.size(0), 1, device=device)
 
             for i, client in enumerate(clients):
                 if client.body_encoder is None or client.head is None:
@@ -587,12 +613,14 @@ def evaluate_global(
                     predictions = client.head(features)
 
                 probs = torch.softmax(predictions, dim=1)
-                weight = client.trust_score
+                # Per-sample confidence: max class probability (B, 1)
+                confidence = probs.max(dim=1, keepdim=True)[0]
+                # Trust × confidence → uncertain clients contribute less
+                weight = client.trust_score * confidence  # (B, 1)
                 ensemble_probs += weight * probs
                 total_weight += weight
 
-            if total_weight > 0:
-                ensemble_probs /= total_weight
+            ensemble_probs = ensemble_probs / total_weight.clamp(min=1e-8)
 
             _, predicted = ensemble_probs.max(1)
             total += y.size(0)
@@ -653,8 +681,8 @@ def save_results(args, global_stats):
         f.write("PER-ROUND METRICS\n")
         f.write("-" * 70 + "\n")
         f.write(f"{'Round':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
-                f"{'Val Loss':>8} | {'Val Acc':>7} | {'Test Acc':>8} | {'Experts':>7}\n")
-        f.write("-" * 70 + "\n")
+                f"{'Val Loss':>8} | {'Val Acc':>7} | {'Test Acc':>8} | {'Experts':>7} | {'Time(s)':>8}\n")
+        f.write("-" * 85 + "\n")
 
         test_acc_idx = 0
         for i, round_num in enumerate(global_stats['round']):
@@ -663,6 +691,7 @@ def save_results(args, global_stats):
             val_loss = global_stats['val_loss'][i]
             val_acc = global_stats['val_acc'][i]
             experts = global_stats['avg_experts_used'][i]
+            rtime = global_stats['round_time'][i] if i < len(global_stats['round_time']) else 0.0
 
             # Test acc is recorded every 5 rounds and on the last round
             if (round_num % 5 == 0 or round_num == len(global_stats['round'])) and test_acc_idx < len(global_stats['test_acc']):
@@ -672,7 +701,7 @@ def save_results(args, global_stats):
                 test_acc_str = "   -   "
 
             f.write(f"{round_num:>6} | {train_loss:>10.4f} | {train_acc:>9.4f} | "
-                    f"{val_loss:>8.4f} | {val_acc:>7.4f} | {test_acc_str:>8} | {experts:>7.1f}\n")
+                    f"{val_loss:>8.4f} | {val_acc:>7.4f} | {test_acc_str:>8} | {experts:>7.1f} | {rtime:>8.2f}\n")
 
         f.write("\n")
 
@@ -696,6 +725,13 @@ def save_results(args, global_stats):
             final_train_loss = global_stats['train_loss'][-1]
             f.write(f"  Final Train Loss:           {final_train_loss:.4f}\n")
 
+        # Timing
+        total_time = global_stats.get('total_training_time', 0.0)
+        f.write(f"  Total Training Time:        {total_time:.2f}s ({total_time/60:.1f}min)\n")
+        if len(global_stats['round_time']) > 0:
+            avg_round_time = np.mean(global_stats['round_time'])
+            f.write(f"  Avg Round Time:             {avg_round_time:.2f}s\n")
+
         f.write("\n")
 
         # Per-client final statistics
@@ -704,7 +740,7 @@ def save_results(args, global_stats):
             f.write("PER-CLIENT FINAL STATISTICS\n")
             f.write("-" * 70 + "\n")
             f.write(f"{'Client':>7} | {'Trust':>6} | {'Val Acc':>7} | "
-                    f"{'Sent':>5} | {'Recv':>5} | {'Registered':>10} | "
+                    f"{'Sent':>5} | {'Recv':>5} | {'Relay':>5} | {'Registered':>10} | "
                     f"{'Used':>5} | {'Cache':>5}\n")
             f.write("-" * 70 + "\n")
 
@@ -712,6 +748,7 @@ def save_results(args, global_stats):
                 f.write(f"{cs['client_id']:>7} | {cs['trust_score']:>6.3f} | "
                         f"{cs['validation_accuracy']:>7.3f} | "
                         f"{cs['experts_sent']:>5} | {cs['experts_received']:>5} | "
+                        f"{cs['experts_relayed']:>5} | "
                         f"{cs['experts_registered']:>10} | "
                         f"{cs['experts_used']:>5} | {cs['cache_size']:>5}\n")
 

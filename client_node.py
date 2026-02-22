@@ -109,6 +109,7 @@ class ClientNode:
             'experts_sent': 0,
             'experts_received': 0,
             'experts_registered': 0,
+            'experts_relayed': 0,
             'experts_used': 0,
             'trust_updates': 0,
             'loss_local': [],
@@ -181,15 +182,44 @@ class ClientNode:
             timestamp=time.time()
         )
     
+    def _relay_if_head(self, package):
+        """Relay cross-cluster expert packages to cluster members.
+
+        Completes the hierarchical top-down dissemination:
+          Bottom-up:  members share with peers → head receives (intra-cluster)
+          Head-to-head: heads exchange cross-cluster (every N rounds)
+          Top-down:   head relays cross-cluster experts to members  ← THIS
+
+        Only cluster heads relay, and only for experts originating from
+        a different cluster. Members never relay, so no infinite loops.
+        """
+        if not self.cluster_manager.is_cluster_head(self.client_id):
+            return
+
+        expert_origin = package.client_id
+        expert_cluster = self.cluster_manager.get_cluster_id(expert_origin)
+        my_cluster = self.cluster_manager.get_cluster_id(self.client_id)
+
+        if expert_cluster is None or my_cluster is None:
+            return
+        if expert_cluster == my_cluster:
+            return  # Same cluster — members already have this via intra-cluster
+
+        peers = self.cluster_manager.get_cluster_peers(self.client_id)
+        if peers:
+            num_relayed = self.transport.broadcast(peers, 'expert_package', package)
+            with self._stats_lock:
+                self._stats['experts_relayed'] += num_relayed
+
     def _handle_expert_package(self, message: Message):
-        """CRITICAL: Registers expert with router"""
+        """CRITICAL: Registers expert with router, relays if cluster head"""
         package = message.payload
         success = self.cache.add(package)
-        
+
         if success:
             try:
                 expert_id = int(package.client_id.split('_')[-1]) if '_' in package.client_id else int(package.client_id)
-                
+
                 self.router.register_expert(
                     expert_id=expert_id,
                     trust_score=package.trust_score,
@@ -207,9 +237,12 @@ class ClientNode:
                     self._stats['experts_registered'] += 1
             except Exception as e:
                 print(f"[{self.client_id}] Registration failed: {e}")
-            
+
             with self._stats_lock:
                 self._stats['experts_received'] += 1
+
+            # Head relay: forward cross-cluster experts to cluster members
+            self._relay_if_head(package)
     
     def compute_representative_features(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
         if self.body_encoder is None:
