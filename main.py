@@ -15,7 +15,6 @@ import torchvision
 import torchvision.transforms as transforms
 
 import time
-import math
 import threading
 import argparse
 import concurrent.futures
@@ -56,12 +55,6 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=1e-4, help='Weight decay for regularization')
     parser.add_argument('--lr_decay', type=float, default=0.98, help='LR decay factor per round')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout in expert heads')
-
-    # Ensemble evaluation settings
-    parser.add_argument('--ensemble_temp', type=float, default=2.0,
-                        help='Temperature for ensemble softmax calibration (higher=softer predictions)')
-    parser.add_argument('--entropy_threshold', type=float, default=0.6,
-                        help='Max normalized entropy to include client in ensemble (0-1, lower=stricter)')
 
     # Data settings
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'mnist'], help='Dataset')
@@ -258,8 +251,6 @@ def run_federated_learning(args):
     print(f"Weight decay: {args.weight_decay}")
     print(f"LR decay: {args.lr_decay}")
     print(f"Dropout: {args.dropout}")
-    print(f"Ensemble Temp: {args.ensemble_temp}")
-    print(f"Entropy Threshold: {args.entropy_threshold}")
     print(f"Partition method: {args.partition_method}")
     if args.partition_method == 'dirichlet':
         print(f"Dirichlet alpha: {args.non_iid_alpha}")
@@ -441,9 +432,7 @@ def run_federated_learning(args):
             
             # Global test every 5 rounds (and always on last round)
             if round_num % 5 == 0 or round_num == args.rounds:
-                test_acc = evaluate_global(clients, test_loader, device,
-                                           ensemble_temp=args.ensemble_temp,
-                                           entropy_threshold=args.entropy_threshold)
+                test_acc = evaluate_global(clients, test_loader, device)
                 global_stats['test_acc'].append(test_acc)
             else:
                 test_acc = None
@@ -480,9 +469,7 @@ def run_federated_learning(args):
     print("FINAL EVALUATION")
     print("="*70 + "\n")
 
-    final_test_acc = evaluate_global(clients, test_loader, device,
-                                     ensemble_temp=args.ensemble_temp,
-                                     entropy_threshold=args.entropy_threshold)
+    final_test_acc = evaluate_global(clients, test_loader, device)
     global_stats['final_test_acc'] = final_test_acc
     total_training_time = time.time() - training_start_time
     global_stats['total_training_time'] = total_training_time
@@ -536,43 +523,31 @@ def run_federated_learning(args):
 def evaluate_global(
     clients: List[ClientNode],
     test_loader: DataLoader,
-    device: torch.device,
-    ensemble_temp: float = 2.0,
-    entropy_threshold: float = 0.6
+    device: torch.device
 ) -> float:
     """
-    Evaluate global test accuracy using entropy-gated MoE ensemble.
+    Evaluate global test accuracy using confidence-weighted MoE ensemble.
 
-    Key insight: each client's body encoder only learned features for ~2 classes
-    (due to label sharding). For unseen classes, features are garbage and MoE
-    can produce confident-but-wrong predictions. We detect this using the LOCAL
-    HEAD's prediction entropy as a proxy for body encoder quality:
+    Each client produces its prediction purely via its router's MoE:
+    1. Router selects top-K experts from all available (including local head)
+    2. Applies per-expert FST and weighted combination
+    3. This MoE output IS the prediction
 
-    - Low entropy  → body encoder "knows" this input → include in ensemble
-    - High entropy → body encoder confused           → exclude from ensemble
-
-    This replaces naive confidence weighting (max softmax of MoE output), which
-    is unreliable because expert heads can map garbage features to sharp logits.
-
-    Additionally, temperature-scaled softmax (T>1) dampens overconfident
-    predictions, reducing the impact of residual wrong-but-confident votes.
+    These MoE predictions are converted to softmax probabilities
+    and trust-weighted ensembled across all clients. Per-sample confidence
+    (max class probability) naturally down-weights uncertain clients.
 
     Args:
         clients: List of clients
         test_loader: Test data loader
         device: Device
-        ensemble_temp: Temperature for softmax calibration (>1 softens predictions)
-        entropy_threshold: Max normalized entropy to include client (0-1)
 
     Returns:
         Ensemble test accuracy
     """
     num_classes = clients[0].num_classes
-    max_entropy = math.log(num_classes)
     correct = 0
     total = 0
-    total_included = 0
-    total_samples = 0
 
     # Prepare all clients: set eval mode and build expert heads from cache
     client_expert_heads = []
@@ -602,11 +577,13 @@ def evaluate_global(
     with torch.no_grad():
         for x, y in test_loader:
             x, y = x.to(device), y.to(device)
-            batch_size = x.size(0)
 
-            ensemble_probs = torch.zeros(batch_size, num_classes, device=device)
-            total_weight = torch.zeros(batch_size, 1, device=device)
-            batch_included = torch.zeros(batch_size, device=device)
+            # Per-sample confidence-weighted ensemble:
+            # Clients uncertain about a sample (poor body encoder features for
+            # that class) produce near-uniform softmax -> low confidence -> low
+            # weight. Clients confident about a sample dominate the ensemble.
+            ensemble_probs = torch.zeros(x.size(0), num_classes, device=device)
+            total_weight = torch.zeros(x.size(0), 1, device=device)
 
             for i, client in enumerate(clients):
                 if client.body_encoder is None or client.head is None:
@@ -614,51 +591,28 @@ def evaluate_global(
 
                 features = client.body_encoder(x)
 
-                # === Expertise Gating ===
-                # Local head was trained end-to-end with this body encoder.
-                # Its entropy reveals whether the body encoder can handle this
-                # input: low entropy → familiar class, high → unseen class.
-                local_logits = client.head(features)
-                local_probs = torch.softmax(local_logits, dim=1)  # (B, C)
-                entropy = -(local_probs * torch.log(local_probs + 1e-8)).sum(dim=1, keepdim=True)  # (B, 1)
-                norm_entropy = entropy / max_entropy  # (B, 1) in [0, 1]
-
-                # Soft expertise: squared to sharpen distinction
-                # expert on class → expertise ≈ 0.5-0.7
-                # not expert      → expertise ≈ 0.01-0.05
-                expertise = (1.0 - norm_entropy) ** 2  # (B, 1)
-
-                # Hard gate: completely exclude if body encoder is clearly confused
-                gate = (norm_entropy < entropy_threshold).float()  # (B, 1)
-
-                # === MoE Prediction ===
                 expert_heads = client_expert_heads[i]
                 if len(expert_heads) > 0:
-                    moe_logits = client.router.forward_moe(
+                    # Pure MoE: router selects from all experts including local
+                    predictions = client.router.forward_moe(
                         features, expert_heads, k=client.top_k_experts
                     )
                 else:
-                    moe_logits = local_logits
+                    predictions = client.head(features)
 
-                # Temperature-calibrated softmax: dampens overconfident predictions
-                moe_probs = torch.softmax(moe_logits / ensemble_temp, dim=1)
-
-                # Final weight: trust × expertise × gate
-                weight = client.trust_score * expertise * gate  # (B, 1)
-                ensemble_probs += weight * moe_probs
+                probs = torch.softmax(predictions, dim=1)
+                # Per-sample confidence: max class probability (B, 1)
+                confidence = probs.max(dim=1, keepdim=True)[0]
+                # Trust x confidence -> uncertain clients contribute less
+                weight = client.trust_score * confidence  # (B, 1)
+                ensemble_probs += weight * probs
                 total_weight += weight
-                batch_included += gate.squeeze(1)
 
             ensemble_probs = ensemble_probs / total_weight.clamp(min=1e-8)
 
             _, predicted = ensemble_probs.max(1)
             total += y.size(0)
             correct += predicted.eq(y).sum().item()
-            total_included += batch_included.sum().item()
-            total_samples += batch_size
-
-    avg_voters = total_included / total_samples if total_samples > 0 else 0
-    print(f"  [Ensemble] Avg clients included per sample: {avg_voters:.1f}/{len(clients)}")
 
     return correct / total if total > 0 else 0.0
 
@@ -707,8 +661,6 @@ def save_results(args, global_stats):
         f.write(f"  Weight Decay:       {args.weight_decay}\n")
         f.write(f"  LR Decay:           {args.lr_decay}\n")
         f.write(f"  Dropout:            {args.dropout}\n")
-        f.write(f"  Ensemble Temp:      {args.ensemble_temp}\n")
-        f.write(f"  Entropy Threshold:  {args.entropy_threshold}\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")
         f.write(f"  Seed:               {args.seed}\n")
         f.write(f"  Device:             {args.device}\n\n")
