@@ -307,20 +307,33 @@ class ClientNode:
         package = self.create_expert_package()
         targets = self.cluster_manager.get_communication_targets(self.client_id)
         experts_sent = 0
-        
+
         if self.current_round % self.cluster_exchange_interval == 0:
             cluster_peers = targets['cluster_peers']
             if len(cluster_peers) > 0:
                 num_sent = self.transport.broadcast(cluster_peers, 'expert_package', package)
                 experts_sent += num_sent
-        
+
         if self.current_round % self.cross_cluster_exchange_interval == 0:
             if self.cluster_manager.is_cluster_head(self.client_id):
                 cluster_heads = targets['cluster_heads']
                 if len(cluster_heads) > 0:
+                    # Send own expert to other cluster heads
                     num_sent = self.transport.broadcast(cluster_heads, 'expert_package', package)
                     experts_sent += num_sent
-        
+
+                    # Also forward all cached intra-cluster experts to other heads.
+                    # Without this, only the head's own expert crosses cluster
+                    # boundaries — members' experts stay trapped in their cluster.
+                    cached_experts = self.cache.get_available_experts(exclude_id=self.client_id)
+                    my_cluster = self.cluster_manager.get_cluster_id(self.client_id)
+                    for cached_pkg in cached_experts:
+                        cached_cluster = self.cluster_manager.get_cluster_id(cached_pkg.client_id)
+                        if cached_cluster == my_cluster:
+                            # This is an intra-cluster member's expert — forward it
+                            num_sent = self.transport.broadcast(cluster_heads, 'expert_package', cached_pkg)
+                            experts_sent += num_sent
+
         with self._stats_lock:
             self._stats['experts_sent'] += experts_sent
     
