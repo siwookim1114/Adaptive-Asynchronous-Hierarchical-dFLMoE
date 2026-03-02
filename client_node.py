@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import time
+import queue
 import threading
 from typing import Dict, List, Optional, Tuple
 
@@ -107,6 +108,11 @@ class ClientNode:
         # Event checked at the start of each epoch — cleared during eval
         # to pause clients at epoch boundaries (fast, no lock contention)
         self.eval_pause = None  # Set by main.py before training starts
+
+        # Thread-safe queue for pending expert registrations.
+        # Transport thread pushes registration data here; training thread
+        # drains it at epoch start. Avoids race on Router state.
+        self._pending_registrations = queue.Queue()
 
         # Statistics
         self._stats = {
@@ -227,7 +233,14 @@ class ClientNode:
                 self._stats['experts_relayed'] += num_relayed
 
     def _handle_expert_package(self, message: Message):
-        """CRITICAL: Registers expert with router, relays if cluster head"""
+        """Queue expert for registration (training thread drains at epoch start).
+
+        The transport thread runs this handler. Instead of calling
+        router.register_expert() here (which would race with the training
+        thread reading router state in forward_moe()), we push the
+        registration data onto a thread-safe queue. The training thread
+        drains it at the start of each epoch in _drain_pending_registrations().
+        """
         package = message.payload
         success = self.cache.add(package)
 
@@ -235,31 +248,57 @@ class ClientNode:
             try:
                 expert_id = int(package.client_id.split('_')[-1]) if '_' in package.client_id else int(package.client_id)
 
-                self.router.register_expert(
-                    expert_id=expert_id,
-                    trust_score=package.trust_score,
-                    validation_accuracy=package.validation_accuracy,
-                    features=package.representative_features,
-                    num_samples=package.num_samples,
-                    timestamp=package.timestamp
-                )
-                # NOTE: FST params are added to optimizer at the start of
-                # _train_epoch_corrected(), NOT here. This handler runs in the
-                # transport thread — calling optimizer methods here would race
-                # with the training thread.
+                # Queue for training thread to process (no router mutation here)
+                self._pending_registrations.put({
+                    'expert_id': expert_id,
+                    'trust_score': package.trust_score,
+                    'validation_accuracy': package.validation_accuracy,
+                    'features': package.representative_features,
+                    'num_samples': package.num_samples,
+                    'timestamp': package.timestamp
+                })
 
                 with self._stats_lock:
                     self._stats['experts_registered'] += 1
             except Exception as e:
-                print(f"[{self.client_id}] Registration failed: {e}")
+                print(f"[{self.client_id}] Registration queued failed: {e}")
 
             with self._stats_lock:
                 self._stats['experts_received'] += 1
 
             # Head relay: forward cross-cluster experts to cluster members
             self._relay_if_head(package)
+
+    def _drain_pending_registrations(self):
+        """Drain queued expert registrations onto the router.
+
+        Called at the start of each epoch on the TRAINING thread, so
+        router mutations are serialized with forward_moe() reads.
+        """
+        while not self._pending_registrations.empty():
+            try:
+                reg = self._pending_registrations.get_nowait()
+                self.router.register_expert(
+                    expert_id=reg['expert_id'],
+                    trust_score=reg['trust_score'],
+                    validation_accuracy=reg['validation_accuracy'],
+                    features=reg['features'],
+                    num_samples=reg['num_samples'],
+                    timestamp=reg['timestamp']
+                )
+            except queue.Empty:
+                break
+            except Exception as e:
+                print(f"[{self.client_id}] Deferred registration failed: {e}")
     
-    def compute_representative_features(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
+    def compute_representative_features(self, data_loader: torch.utils.data.DataLoader, max_batches: int = 5) -> torch.Tensor:
+        """Compute mean feature vector from a sample of batches.
+
+        Uses at most `max_batches` batches instead of the full dataset
+        to avoid a full forward pass every round (~5x faster for large datasets).
+        The mean over 5 batches (320 samples at batch_size=64) is statistically
+        sufficient for clustering similarity.
+        """
         if self.body_encoder is None:
             return torch.randn(self.feature_dim)
 
@@ -268,7 +307,9 @@ class ClientNode:
         features_list = []
 
         with torch.no_grad():
-            for x, _ in data_loader:
+            for batch_idx, (x, _) in enumerate(data_loader):
+                if batch_idx >= max_batches:
+                    break
                 device = next(self.body_encoder.parameters()).device
                 x = x.to(device)
                 features = self.body_encoder(x)
@@ -435,6 +476,11 @@ class ClientNode:
         if self.eval_pause is not None:
             self.eval_pause.wait()
 
+        # Drain queued registrations from transport thread onto router.
+        # This is the ONLY place router state is mutated during training,
+        # serializing it with forward_moe() reads (both on training thread).
+        self._drain_pending_registrations()
+
         # Ensure any FSTs created since last epoch are in the optimizer
         self._ensure_fsts_in_optimizer()
 
@@ -470,6 +516,7 @@ class ClientNode:
             local_head_copy.load_state_dict(self.head.state_dict())
             local_head_copy = local_head_copy.to(device)
             local_head_copy.eval()
+            local_head_copy.requires_grad_(False)  # Frozen: no gradients needed
             expert_heads[self.local_expert_id] = local_head_copy
 
         for x, y in data_loader:
@@ -506,7 +553,7 @@ class ClientNode:
                 self.optimizer_body.step()
                 self.optimizer_router.step()
 
-                experts_used_count += len(expert_heads)
+                experts_used_count += min(self.top_k_experts, len(expert_heads))
                 # Prediction is purely MoE — router decides all weights dynamically
                 predictions = moe_logits
             else:

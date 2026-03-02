@@ -511,12 +511,12 @@ def run_federated_learning(args):
                   f"Client rounds: {client_round_counts}")
             print(f"{'='*70}")
 
-            # Pause all clients at their next epoch boundary
-            # (clients check eval_pause.wait() at start of each epoch)
-            eval_pause.clear()
-            time.sleep(3)  # Wait for in-flight batches to finish (~1-2s each)
-
             try:
+                # Pause all clients at their next epoch boundary
+                # (clients check eval_pause.wait() at start of each epoch)
+                # INSIDE try so that Ctrl+C during sleep still triggers finally→set()
+                eval_pause.clear()
+                time.sleep(3)  # Wait for in-flight batches to finish (~1-2s each)
                 # Set eval mode on all clients
                 for client in clients:
                     if client.body_encoder is not None:

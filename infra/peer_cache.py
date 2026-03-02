@@ -352,8 +352,8 @@ class PeerCache:
             if client_id not in self.cache:
                 return False
             
-            # Clamp trust score
-            new_trust = max(0.1, min(2.0, new_trust))
+            # Clamp trust score (consistent with router's [0.1, 1.0] range)
+            new_trust = max(0.1, min(1.0, new_trust))
             self.cache[client_id].trust_score = new_trust
 
             # Persist if enabled
