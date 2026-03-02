@@ -100,6 +100,10 @@ class TCPTransport:
         # Peer addresses: {peer_id: (host, port)}
         self.peer_addresses: Dict[str, Tuple[str, int]] = {}
 
+        # Per-peer send locks: serializes send() calls to the same peer
+        # so that length-prefixed messages don't interleave on the socket
+        self.send_locks: Dict[str, threading.Lock] = {}
+
         # Server socket
         self.server_socket: Optional[socket.socket] = None
         self.server_thread: Optional[threading.Thread] = None
@@ -242,18 +246,24 @@ class TCPTransport:
         return data
     
     def dispatch_message(self, message: Message):
-        """Dispatch message to appropriate handler"""
+        """Dispatch message to appropriate handler.
+
+        Lock is held only during the dict lookup (microseconds), NOT during
+        handler execution. This prevents relay broadcasts from blocking
+        all incoming message reception.
+        """
         with self.handler_lock:
-            if message.message_type in self.message_handlers:   # Look up handler function for this message type
-                handler = self.message_handlers[message.message_type]      
-                try:
-                    handler(message)
-                except Exception as e:
-                    with self.stats_lock:
-                        self.stats["errors"] += 1
-                    print(f"[Transport:{self.client_id}] Handler error: {e}")
-            else:
-                print(f"[Transport:{self.client_id}]No handler for '{message.message_type}'")
+            handler = self.message_handlers.get(message.message_type)
+
+        if handler is not None:
+            try:
+                handler(message)
+            except Exception as e:
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+                print(f"[Transport:{self.client_id}] Handler error: {e}")
+        else:
+            print(f"[Transport:{self.client_id}] No handler for '{message.message_type}'")
 
     def register_handler(self, message_type: str, handler: Callable):
         """
@@ -360,37 +370,45 @@ class TCPTransport:
         sock = self.get_or_create_connection(receiver_id)
         if sock is None:
             return False
-        
-        try:
-            # Send length (4 bytes, network bytes order)
-            length_bytes = struct.pack("!I", message_length)
-            sock.sendall(length_bytes)
 
-            # Send message data
-            sock.sendall(message_data)
+        # Get or create per-peer send lock (prevents concurrent writes
+        # from interleaving length+data on the same socket)
+        with self.peer_lock:
+            if receiver_id not in self.send_locks:
+                self.send_locks[receiver_id] = threading.Lock()
+            send_lock = self.send_locks[receiver_id]
 
-            # Update statistics
-            with self.stats_lock:
-                self.stats["sent"] += 1
-                self.stats["bytes_sent"] += message_length
-            
-            print(f"[Transport:{self.client_id}] Sent '{message_type}' "
-                  f"to {receiver_id} ({message_length} bytes)")
+        with send_lock:
+            try:
+                # Send length (4 bytes, network bytes order)
+                length_bytes = struct.pack("!I", message_length)
+                sock.sendall(length_bytes)
 
-            return True
-        
-        except Exception as e:
-            print(f"[Transport:{self.client_id}] Send error to {receiver_id}: {e}")
+                # Send message data
+                sock.sendall(message_data)
 
-            # Remove dead connection
-            with self.peer_lock:
-                if receiver_id in self.peer_sockets:
-                    del self.peer_sockets[receiver_id]
-            
-            with self.stats_lock:
-                self.stats["errors"] += 1
+                # Update statistics
+                with self.stats_lock:
+                    self.stats["sent"] += 1
+                    self.stats["bytes_sent"] += message_length
 
-            return False
+                print(f"[Transport:{self.client_id}] Sent '{message_type}' "
+                      f"to {receiver_id} ({message_length} bytes)")
+
+                return True
+
+            except Exception as e:
+                print(f"[Transport:{self.client_id}] Send error to {receiver_id}: {e}")
+
+                # Remove dead connection
+                with self.peer_lock:
+                    if receiver_id in self.peer_sockets:
+                        del self.peer_sockets[receiver_id]
+
+                with self.stats_lock:
+                    self.stats["errors"] += 1
+
+                return False
         
     def broadcast(self, peer_ids: List[str], message_type: str, payload: Any) -> int:
         """
@@ -424,7 +442,7 @@ class TCPTransport:
     def get_statistics(self) -> Dict:
         """Get transport statistics"""
         with self.stats_lock:
-            return self.stats
+            return dict(self.stats)
 
     def print_statistics(self):
         """Print formatted statistics"""

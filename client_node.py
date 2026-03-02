@@ -505,6 +505,7 @@ class ClientNode:
                 head_temp.load_state_dict(pkg.head_state_dict)
                 head_temp = head_temp.to(device)
                 head_temp.eval()
+                head_temp.requires_grad_(False)  # Frozen: no gradients needed
                 expert_heads[eid] = head_temp
 
         # Include a FROZEN COPY of local head in MoE expert pool.
