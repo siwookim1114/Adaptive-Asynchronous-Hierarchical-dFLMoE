@@ -35,7 +35,7 @@ class ExpertPackage:
         self.representative_features = representative_features
         self.num_samples = num_samples
 
-    def get_staleness(self, lambda_decay: float = 0.001) -> float:
+    def get_staleness(self, lambda_decay: float = 0.005) -> float:
         """
         Compute staleness factor: e^(-lambda * delta_t)
 
@@ -71,7 +71,7 @@ class PeerCache:
     - Optional disk persistence
     - Thread-safe operations using RLock
     """
-    def __init__(self, max_cache_size: int = 100, max_age_seconds: float = 3600.0, staleness_decay: float = 0.001, cache_dir: Optional[str] = None, auto_evict: bool = True):
+    def __init__(self, max_cache_size: int = 100, max_age_seconds: float = 300.0, staleness_decay: float = 0.005, cache_dir: Optional[str] = None, auto_evict: bool = True):
         """
         Initialize peer cache
 
@@ -243,9 +243,9 @@ class PeerCache:
                 return None
     
     def get_all(self) -> Dict[str, ExpertPackage]:
-        """Get all cached experts"""
+        """Get all cached experts (returns copy for thread safety)"""
         with self.lock:
-            return self.cache
+            return dict(self.cache)
     
     def get_available_experts(self, exclude_id: Optional[str] = None) -> List[ExpertPackage]:
         """

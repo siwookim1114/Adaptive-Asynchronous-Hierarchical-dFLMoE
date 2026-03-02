@@ -27,7 +27,7 @@ class ExpertMetadata:
     """
     def __init__(self, expert_id: int):
         self.expert_id = expert_id
-        self.trust_score = 1.0   # T_{ij} -> From head's validation_accuracy
+        self.trust_score = 0.5   # Neutral init (not optimistic 1.0) for faster EMA convergence
         self.last_update_time = time.time()   # For computing delta_t
         self.feature_embedding = None     # For computing similarity S_{ij}
         self.num_samples = 0    # From head metadata
@@ -76,7 +76,7 @@ class ExpertMetadata:
         - Gives balance between stability and adaptability -> D
         """
         self.trust_score = decay * self.trust_score + (1 - decay) * performance
-        self.trust_score = max(0.1, min(2.0, self.trust_score))     # Clamping it to [0.1, 2.0]
+        self.trust_score = max(0.1, min(1.0, self.trust_score))     # Clamping to [0.1, 1.0]
 
 class Router(nn.Module):
     """
@@ -97,7 +97,7 @@ class Router(nn.Module):
         num_classes: int = 10,
         temperature: float = 1.0,
         top_k: int = 3,
-        staleness_lambda: float = 0.001,
+        staleness_lambda: float = 0.005,
         similarity_type: str = "cosine",
         use_learned_gating: bool = True
     ):
@@ -136,8 +136,8 @@ class Router(nn.Module):
 
             # Learnable embedding per expert (indexed by expert_id)
             self.expert_embeddings = nn.Embedding(num_experts, hidden_dim)
-            # Small init so sigmoid(~0) ≈ 0.5, letting base_score dominate initially
-            nn.init.normal_(self.expert_embeddings.weight, mean=0, std=0.01)
+            # Moderate init so experts are distinguishable from round 1
+            nn.init.normal_(self.expert_embeddings.weight, mean=0, std=0.1)
 
             print(f"[Router] Gating: proj({feature_dim}->{hidden_dim}) · expert_emb({num_experts}x{hidden_dim})")
             
@@ -190,7 +190,7 @@ class Router(nn.Module):
             self.expert_metadata[expert_id] = ExpertMetadata(expert_id)
         
         metadata = self.expert_metadata[expert_id]
-        metadata.trust_score = trust_score
+        metadata.update_trust(trust_score)  # EMA: smooth evolution instead of direct overwrite
         metadata.validation_accuracy = validation_accuracy
         metadata.num_samples = num_samples
         metadata.last_update_time = timestamp if timestamp else time.time()
@@ -254,8 +254,10 @@ class Router(nn.Module):
             # Cosine similarity: (f1 dot f2) / (||f1|| ||f2||)
             similarity = F.cosine_similarity(features, expert_feat, dim = 1)
             
-            # Convert from [-1, 1] to [0, 1]
-            similarity = (similarity + 1.0) / 2.0
+            # Clamp to [0, 1] without compressing range
+            # (sim+1)/2 would map 0.6-0.9 to 0.8-0.95 (15% spread)
+            # clamp keeps 0.6-0.9 as 0.6-0.9 (30% spread, 2x more discriminative)
+            similarity = torch.clamp(similarity, min=0.0)
 
         elif self.similarity_type == "kl":
             # KL divergence (convert to similarity)
@@ -567,4 +569,4 @@ class Router(nn.Module):
             if expert_key in self.fst_transforms:
                 del self.fst_transforms[expert_key]
             if self.use_learned_gating and expert_id < self.num_experts:
-                nn.init.normal_(self.expert_embeddings.weight[expert_id], mean=0, std=0.01)
+                nn.init.normal_(self.expert_embeddings.weight[expert_id], mean=0, std=0.1)

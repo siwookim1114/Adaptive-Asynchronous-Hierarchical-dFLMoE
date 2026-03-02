@@ -133,6 +133,7 @@ class DataPartitioner:
         
         return client_classes
     
+
     def dirichlet_partition(self) -> List[np.ndarray]:
         """
         Dirichlet: Each client gets all classes with different proportions

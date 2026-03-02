@@ -38,7 +38,7 @@ class ClientNode:
         num_classes: int = 10,
         num_experts: int = 10,
         max_cache_size: int = 50,
-        staleness_lambda: float = 0.001,
+        staleness_lambda: float = 0.005,
         top_k_experts: int = 3,
         alpha: float = 0.5,
         warmup_rounds: int = 10,
@@ -47,7 +47,8 @@ class ClientNode:
         learning_rate_body: float = 0.001,
         learning_rate_router: float = 0.001,
         weight_decay: float = 1e-4,
-        lr_decay: float = 0.98
+        lr_decay: float = 0.98,
+        max_expert_age: float = 300.0
     ):
         self.client_id = client_id
         self.local_expert_id = int(client_id.split('_')[-1]) if '_' in client_id else int(client_id)
@@ -67,7 +68,7 @@ class ClientNode:
         self.dropout = 0.0  # Set by main.py via head creation; stored for eval
         
         # Components
-        self.cache = PeerCache(max_cache_size=max_cache_size, staleness_decay=staleness_lambda)
+        self.cache = PeerCache(max_cache_size=max_cache_size, staleness_decay=staleness_lambda, max_age_seconds=max_expert_age)
         self.transport = TCPTransport(client_id=client_id, host=host, port=port)
         self.cluster_manager = cluster_manager
         self.router = Router(
@@ -103,6 +104,10 @@ class ClientNode:
         # (FSTs created after optimizer init must be explicitly added)
         self._registered_fst_keys = set()
 
+        # Event checked at the start of each epoch — cleared during eval
+        # to pause clients at epoch boundaries (fast, no lock contention)
+        self.eval_pause = None  # Set by main.py before training starts
+
         # Statistics
         self._stats = {
             'rounds_completed': 0,
@@ -133,14 +138,24 @@ class ClientNode:
         register. Since the optimizer is created before any FSTs exist,
         new FST parameters must be explicitly added via add_param_group.
         Without this, FSTs stay at identity init and never learn.
+
+        Uses the current decayed LR (from existing param groups) so that
+        late-arriving FSTs don't get a much higher LR than existing ones.
         """
         if self.optimizer_router is None:
             return
+
+        # Use current decayed LR so new FSTs match existing param groups
+        if len(self.optimizer_router.param_groups) > 0:
+            current_lr = self.optimizer_router.param_groups[0]['lr']
+        else:
+            current_lr = self.lr_router
+
         for key, fst in self.router.fst_transforms.items():
             if key not in self._registered_fst_keys:
                 self.optimizer_router.add_param_group({
                     'params': list(fst.parameters()),
-                    'lr': self.lr_router,
+                    'lr': current_lr,
                     'weight_decay': self.weight_decay
                 })
                 self._registered_fst_keys.add(key)
@@ -247,30 +262,34 @@ class ClientNode:
     def compute_representative_features(self, data_loader: torch.utils.data.DataLoader) -> torch.Tensor:
         if self.body_encoder is None:
             return torch.randn(self.feature_dim)
-        
+
+        was_training = self.body_encoder.training
         self.body_encoder.eval()
         features_list = []
-        
+
         with torch.no_grad():
             for x, _ in data_loader:
                 device = next(self.body_encoder.parameters()).device
                 x = x.to(device)
                 features = self.body_encoder(x)
                 features_list.append(features.cpu())
-        
+
+        if was_training:
+            self.body_encoder.train()
+
         if len(features_list) > 0:
             all_features = torch.cat(features_list, dim=0)
             representative = all_features.mean(dim=0)
             self.representative_features = representative
             return representative
-        
+
         return self.representative_features
     
     def compute_trust_score(self, validation_accuracy: float, num_samples: int):
-        accuracy_component = validation_accuracy
-        data_component = min(1.0, num_samples / 10000.0)
-        self.trust_score = 0.7 * accuracy_component + 0.3 * data_component
-        self.trust_score = max(0.0, min(1.0, self.trust_score))
+        # Trust = validation accuracy directly (no data_component smoothing
+        # that compressed all clients to ~0.75). This creates real differentiation:
+        # a client with 95% val_acc gets trust 0.95, while 75% gets 0.75.
+        self.trust_score = max(0.1, min(1.0, validation_accuracy))
         self.validation_accuracy = validation_accuracy
         self.num_samples = num_samples
         
@@ -278,16 +297,18 @@ class ClientNode:
             self._stats['trust_updates'] += 1
     
     def _get_current_alpha(self) -> float:
-        """Adaptive alpha with warm-up schedule.
+        """Adaptive alpha with quadratic warm-up schedule.
 
-        Linearly decays from 1.0 (pure local) to target alpha over
-        warmup_rounds. This lets body/head stabilize before MoE
-        contributes significant gradient signal.
+        Decays from 1.0 (pure local) to target alpha using a concave
+        (quadratic) curve that gives MoE more gradient signal earlier
+        than linear. At round 5/10 with alpha=0.5: MoE gets 37% weight
+        (vs 25% linear), letting the router learn routing faster.
         """
         if self.warmup_rounds <= 0 or self.current_round >= self.warmup_rounds:
             return self.alpha
         progress = self.current_round / self.warmup_rounds
-        return 1.0 - (1.0 - self.alpha) * progress
+        # Quadratic decay: MoE gets more gradient earlier than linear
+        return self.alpha + (1.0 - self.alpha) * (1.0 - progress) ** 2
 
     def create_expert_package(self) -> ExpertPackage:
         if self.head is None:
@@ -404,21 +425,30 @@ class ClientNode:
         device: torch.device,
         use_experts: bool
     ) -> Dict:
-        """Training with hybrid loss and gradient routing"""
+        """Training with hybrid loss and gradient routing.
+
+        Checks eval_pause at the start of each epoch so that the eval
+        thread can pause clients at epoch boundaries (within one batch's
+        time) without holding a lock for the entire epoch.
+        """
+        # Pause here if evaluation is happening — fast, no lock contention
+        if self.eval_pause is not None:
+            self.eval_pause.wait()
+
         # Ensure any FSTs created since last epoch are in the optimizer
         self._ensure_fsts_in_optimizer()
 
         self.body_encoder.train()
         self.head.train()
         self.router.train()
-        
+
         total_loss_local = 0.0
         total_loss_moe = 0.0
         total_loss_full = 0.0
         correct = 0
         total = 0
         experts_used_count = 0
-        
+
         # Pre-build expert heads once per epoch (they don't change within an epoch)
         expert_heads = {}
         if use_experts and self.cache.size() > 0:
@@ -488,26 +518,26 @@ class ClientNode:
                 self.optimizer_head.step()
                 self.optimizer_body.step()
                 predictions = local_logits
-            
+
             total_loss_local += loss_local.item()
             total_loss_moe += loss_moe.item() if isinstance(loss_moe, torch.Tensor) else 0.0
             total_loss_full += loss_full.item()
-            
+
             _, predicted = predictions.max(1)
             total += y.size(0)
             correct += predicted.eq(y).sum().item()
-        
+
         avg_loss_local = total_loss_local / len(data_loader)
         avg_loss_moe = total_loss_moe / len(data_loader)
         avg_loss_full = total_loss_full / len(data_loader)
         accuracy = correct / total
-        
+
         with self._stats_lock:
             self._stats['loss_local'].append(avg_loss_local)
             self._stats['loss_moe'].append(avg_loss_moe)
             self._stats['loss_total'].append(avg_loss_full)
             self._stats['experts_used'] += experts_used_count
-        
+
         return {
             'loss_local': avg_loss_local,
             'loss_moe': avg_loss_moe,

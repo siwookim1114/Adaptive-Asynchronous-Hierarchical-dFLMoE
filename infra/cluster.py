@@ -127,11 +127,13 @@ class ClusterManager:
 
         # Client information: {client_id: ClientInfo}
         self.clients: Dict[str, ClientInfo] = {}
-        self.clients_lock = threading.RLock()
 
         # Clusters: {cluster_id: Cluster}
         self.clusters: Dict[str, Cluster] = {}
-        self.cluster_lock = threading.RLock()
+
+        # Single reentrant lock for all state (prevents lock ordering deadlocks
+        # that occurred with separate clients_lock and cluster_lock)
+        self._lock = threading.RLock()
 
         # Clustering state
         self.last_clustering_time = 0.0
@@ -158,7 +160,7 @@ class ClusterManager:
             features: Representative features (embedding)
             trust_score: Initial trust score
         """
-        with self.clients_lock:
+        with self._lock:
             # Create client info
             client_info = ClientInfo(client_id, features, trust_score)    # Client information
             self.clients[client_id] = client_info
@@ -181,7 +183,7 @@ class ClusterManager:
             features: New representative features (optional)
             trust_score: New trust score (optional)
         """
-        with self.clients_lock:
+        with self._lock:
             if client_id not in self.clients:
                 print(f"[ClusterManager] Unknown client: {client_id}")
                 return
@@ -192,19 +194,19 @@ class ClusterManager:
                 client_info.features = features    # Update with new features
                 # Re-clustering is now managed at orchestration level (main.py)
                 # to prevent excessive re-clustering every round
-            
+
             # Update trust score if provided
             if trust_score is not None:
                 old_trust = client_info.trust_score      # Store original old trust score
                 client_info.trust_score = trust_score    # Update with new trust_score
 
                 # If this client is cluster head and trust decreased significantly
-                # Consider selecting new head
-                if client_info.is_cluster_head and trust_score < old_trust * 0.8:   # If trust decreased more than 80%
+                # Consider selecting new head (safe: _lock is reentrant)
+                if client_info.is_cluster_head and trust_score < old_trust * 0.8:
                     cluster_id = client_info.cluster_id
-                    if cluster_id is not None:
-                        self.select_cluster_head(cluster_id)    # Select the cluster head again
-            
+                    if cluster_id is not None and cluster_id in self.clusters:
+                        self.select_cluster_head(cluster_id)
+
             client_info.last_updated = time.time()
 
     def remove_client(self, client_id: str):
@@ -214,10 +216,10 @@ class ClusterManager:
         Args:
             client_id: Client to remove
         """
-        with self.clients_lock, self.cluster_lock:
+        with self._lock:
             if client_id not in self.clients:
-                return 
-            
+                return
+
             client_info = self.clients[client_id]
             cluster_id = client_info.cluster_id
 
@@ -249,7 +251,7 @@ class ClusterManager:
 
         Uses K-Means clustering on representative features
         """
-        with self.clients_lock, self.cluster_lock:
+        with self._lock:
             if len(self.clients) < 2:
                 print("[ClusterManager] Not enough clients for clustering")
                 return
@@ -439,16 +441,16 @@ class ClusterManager:
         Returns: 
             List of peer IDs (excluding self)
         """
-        with self.clients_lock, self.cluster_lock:
+        with self._lock:
             if client_id not in self.clients:
                 return []
-            
+
             client_info = self.clients[client_id]
             cluster_id = client_info.cluster_id
 
             if cluster_id is None or cluster_id not in self.clusters:
                 return []
-            
+
             cluster = self.clusters[cluster_id]
 
             # Return all members except self
@@ -466,15 +468,14 @@ class ClusterManager:
         Returns:
             List of cluster head IDs
         """
-        with self.cluster_lock:
+        with self._lock:
             heads = []
 
             # Get own cluster if excluding
             my_cluster_id = None
             if exclude_own_cluster and my_client_id:
-                with self.clients_lock:
-                    if my_client_id in self.clients:
-                        my_cluster_id = self.clients[my_client_id].cluster_id
+                if my_client_id in self.clients:
+                    my_cluster_id = self.clients[my_client_id].cluster_id
             
             # Collect cluster heads
             for cluster_id, cluster in self.clusters.items():
@@ -497,7 +498,7 @@ class ClusterManager:
         Returns:
             List of client IDs in the cluster
         """
-        with self.cluster_lock:
+        with self._lock:
             if cluster_id not in self.clusters:
                 return []
             return list(self.clusters[cluster_id].member_ids)
@@ -512,7 +513,7 @@ class ClusterManager:
         Returns:
             Cluster ID or None
         """
-        with self.clients_lock:
+        with self._lock:
             if client_id in self.clients:
                 return self.clients[client_id].cluster_id
             return None
@@ -527,7 +528,7 @@ class ClusterManager:
         Returns:
             True if cluster head
         """
-        with self.clients_lock:
+        with self._lock:
             if client_id in self.clients:
                 return self.clients[client_id].is_cluster_head
             return False

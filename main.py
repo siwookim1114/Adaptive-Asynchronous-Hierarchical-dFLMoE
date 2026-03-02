@@ -1,10 +1,10 @@
 """
 Complete orchestration of federated learning system with:
-- Multiple clients with heterogeneous data
-- Hierarchical clustering
-- Expert routing with FST
+- TRUE asynchronous training (no round barrier — each client trains independently)
+- Hierarchical clustering with time-based reclustering
+- Expert routing with FST and trust-weighted scoring
+- Dynamic adaptive cache with staleness eviction
 - Hybrid loss training
-- Trust-based collaboration
 """
 
 import torch
@@ -16,8 +16,8 @@ import torchvision.transforms as transforms
 
 import time
 import threading
+import queue
 import argparse
-import concurrent.futures
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
@@ -33,17 +33,17 @@ from utils.data_utils import DataPartitioner, get_dataset, verify_partitioning
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='Federated Learning with Adaptive MoE')
-    
+
     # System settings
     parser.add_argument('--num_clients', type=int, default=10, help='Number of clients')
     parser.add_argument('--num_clusters', type=int, default=3, help='Number of clusters')
-    parser.add_argument('--rounds', type=int, default=100, help='Number of training rounds')
-    
+    parser.add_argument('--rounds', type=int, default=100, help='Number of training rounds per client')
+
     # Model settings
     parser.add_argument('--feature_dim', type=int, default=512, help='Feature dimension')
     parser.add_argument('--num_classes', type=int, default=10, help='Number of classes')
     parser.add_argument('--top_k_experts', type=int, default=3, help='Top-K experts to select')
-    
+
     # Training settings
     parser.add_argument('--alpha', type=float, default=0.6, help='Hybrid loss weight (local)')
     parser.add_argument('--warmup_rounds', type=int, default=10, help='Rounds for alpha warm-up (1.0 to target alpha)')
@@ -56,6 +56,16 @@ def parse_args():
     parser.add_argument('--lr_decay', type=float, default=0.98, help='LR decay factor per round')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout in expert heads')
 
+    # Async and adaptive settings
+    parser.add_argument('--staleness_lambda', type=float, default=0.005,
+                        help='Staleness decay rate for e^(-lambda*t) scoring')
+    parser.add_argument('--max_expert_age', type=float, default=300.0,
+                        help='Max expert age in seconds before cache eviction')
+    parser.add_argument('--eval_interval', type=float, default=120.0,
+                        help='Seconds between global evaluations')
+    parser.add_argument('--recluster_interval', type=float, default=150.0,
+                        help='Seconds between reclustering')
+
     # Data settings
     parser.add_argument('--dataset', type=str, default='cifar10', choices=['cifar10', 'mnist'], help='Dataset')
     parser.add_argument('--partition_method', type=str, default='dirichlet',
@@ -63,12 +73,12 @@ def parse_args():
                         help='Data partitioning method')
     parser.add_argument('--non_iid_alpha', type=float, default=0.5, help='Dirichlet alpha (lower=more non-IID)')
     parser.add_argument('--classes_per_client', type=int, default=2, help='Classes per client (for label_sharding)')
-    
+
     # Other settings
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
-    
+
     return parser.parse_args()
 
 
@@ -228,22 +238,29 @@ def create_models(feature_dim: int, num_classes: int, device: torch.device, data
 
 def run_federated_learning(args):
     """
-    Main federated learning orchestration
-    
+    Main federated learning orchestration with TRUE asynchronous training.
+
+    Each client runs its own independent training loop in a separate thread.
+    There is NO global round barrier — faster clients proceed without waiting
+    for slower ones. Expert packages arrive asynchronously via TCP transport.
+
+    Periodic operations (evaluation, reclustering) are time-based, not
+    round-based, fitting the asynchronous model.
+
     Args:
         args: Command line arguments
     """
     print("\n" + "="*70)
-    print("FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE")
+    print("ASYNC FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE")
     print("="*70 + "\n")
-    
+
     # Setup
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     print(f"Number of clients: {args.num_clients}")
     print(f"Number of clusters: {args.num_clusters}")
-    print(f"Training rounds: {args.rounds}")
+    print(f"Training rounds (per client): {args.rounds}")
     print(f"Alpha (local weight): {args.alpha}")
     print(f"Warmup rounds: {args.warmup_rounds}")
     print(f"Local epochs: {args.local_epochs}")
@@ -251,6 +268,10 @@ def run_federated_learning(args):
     print(f"Weight decay: {args.weight_decay}")
     print(f"LR decay: {args.lr_decay}")
     print(f"Dropout: {args.dropout}")
+    print(f"Staleness lambda: {args.staleness_lambda}")
+    print(f"Max expert age: {args.max_expert_age}s")
+    print(f"Eval interval: {args.eval_interval}s")
+    print(f"Recluster interval: {args.recluster_interval}s")
     print(f"Partition method: {args.partition_method}")
     if args.partition_method == 'dirichlet':
         print(f"Dirichlet alpha: {args.non_iid_alpha}")
@@ -287,11 +308,11 @@ def run_federated_learning(args):
         num_clusters=args.num_clusters
     )
     print(f"  Clusters: {args.num_clusters}\n")
-    
+
     # Create clients
     print("Creating clients...")
     clients: List[ClientNode] = []
-    
+
     for i in range(args.num_clients):
         client = ClientNode(
             client_id=f"client_{i}",
@@ -302,7 +323,7 @@ def run_federated_learning(args):
             num_classes=args.num_classes,
             num_experts=args.num_clients,
             max_cache_size=args.num_clients,
-            staleness_lambda=0.001,
+            staleness_lambda=args.staleness_lambda,
             top_k_experts=args.top_k_experts,
             alpha=args.alpha,
             warmup_rounds=args.warmup_rounds,
@@ -311,20 +332,21 @@ def run_federated_learning(args):
             learning_rate_body=args.lr_body,
             learning_rate_router=args.lr_router,
             weight_decay=args.weight_decay,
-            lr_decay=args.lr_decay
+            lr_decay=args.lr_decay,
+            max_expert_age=args.max_expert_age
         )
-        
+
         # Create models for this client
         body_encoder, head = create_models(args.feature_dim, args.num_classes, device, args.dataset, args.dropout)
         client.set_model(body_encoder, head)
-        
+
         clients.append(client)
-        
+
         if args.verbose:
             print(f"  Client {i}: {client.transport.port}")
-    
+
     print(f"  Created {len(clients)} clients\n")
-    
+
     # Register peer addresses for transport communication
     print("Registering peer addresses...")
     for i, client_i in enumerate(clients):
@@ -335,54 +357,69 @@ def run_federated_learning(args):
                 client_i.transport.register_peer(client_j.client_id, '127.0.0.1', port)
     time.sleep(1)  # Wait for registrations
     print("  All peer addresses registered\n")
-    
+
     # Perform initial clustering
     print("Performing initial clustering...")
     cluster_manager.perform_clustering()
-    
+
     # Print cluster assignments
     for cluster_id in range(args.num_clusters):
         members = cluster_manager.get_cluster_members(cluster_id)
         print(f"  Cluster {cluster_id}: {len(members)} members")
     print()
-    
+
     # Loss function
     criterion = nn.CrossEntropyLoss()
-    
-    # Training loop
+
+    # ================================================================
+    # TRUE ASYNCHRONOUS TRAINING
+    # Each client runs its own independent training loop in a thread.
+    # No global round barrier — faster clients proceed without waiting.
+    # ================================================================
     print("\n" + "="*70)
-    print("STARTING TRAINING")
+    print("STARTING ASYNCHRONOUS TRAINING")
     print("="*70 + "\n")
-    
+
+    # Shared communication
+    stats_queue = queue.Queue()       # Clients report metrics here
+    eval_pause = threading.Event()    # Cleared during evaluation to pause clients
+    eval_pause.set()                  # Not paused initially
+
+    # Wire eval_pause to all clients so they check it at epoch boundaries
+    for client in clients:
+        client.eval_pause = eval_pause
+
     # Statistics tracking
     global_stats = {
-        'round': [],
-        'train_loss': [],
-        'train_acc': [],
-        'val_loss': [],
-        'val_acc': [],
+        'timestamps': [],         # Wall-clock time of each evaluation
+        'eval_round_counts': [],  # Per-client round counts at each eval
         'test_acc': [],
+        'avg_train_loss': [],
+        'avg_train_acc': [],
+        'avg_val_loss': [],
+        'avg_val_acc': [],
+        'avg_cache_size': [],
         'avg_experts_used': [],
-        'round_time': []
     }
 
-    training_start_time = time.time()
-    
-    for round_num in range(1, args.rounds + 1):
-        print(f"\n{'='*70}")
-        print(f"ROUND {round_num}/{args.rounds}")
-        print(f"{'='*70}\n")
-        
-        round_start_time = time.time()
-        
-        # Train all clients concurrently (asynchronous federated learning)
-        # Each client trains in its own thread. While clients train, expert
-        # packages from other clients can arrive via transport handlers,
-        # enabling true asynchronous expert exchange.
-        round_metrics = []
+    # Per-client latest metrics (updated from queue)
+    client_latest_metrics = [None] * args.num_clients
+    client_round_counts = [0] * args.num_clients
 
-        def train_one_client(idx, client, train_loader, val_loader):
-            """Train a single client in a thread."""
+    training_start_time = time.time()
+
+    def client_training_loop(idx, client, train_loader, val_loader):
+        """Independent training loop for a single client.
+
+        This function runs in its own thread. The client trains for
+        args.rounds local rounds at its own pace, with no synchronization
+        barrier with other clients. Expert packages arrive asynchronously
+        via the transport layer during training.
+        """
+        for local_round in range(1, args.rounds + 1):
+            # eval_pause is checked at each epoch boundary inside
+            # _train_epoch_corrected(), so clients pause quickly
+
             try:
                 metrics = client.train_round(
                     train_loader=train_loader,
@@ -391,94 +428,190 @@ def run_federated_learning(args):
                     device=device,
                     use_experts=True
                 )
-                return idx, metrics, None
+                stats_queue.put(('metrics', idx, local_round, metrics))
             except Exception as e:
-                return idx, None, e
+                stats_queue.put(('error', idx, local_round, str(e)))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_clients) as executor:
-            futures = [
-                executor.submit(train_one_client, i, client, train_loaders[i], val_loaders[i])
-                for i, client in enumerate(clients)
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                idx, metrics, error = future.result()
-                if error:
-                    print(f"  Client {idx} error: {error}")
-                elif metrics:
-                    round_metrics.append(metrics)
-                    if args.verbose or idx == 0:
-                        print(f"Client {idx}: "
-                              f"Train Loss={metrics['train_loss']:.4f}, "
-                              f"Train Acc={metrics['train_acc']:.3f}, "
-                              f"Val Acc={metrics['val_acc']:.3f}, "
-                              f"Trust={metrics['trust_score']:.3f}, "
-                              f"Cache={metrics['cache_size']}, "
-                              f"Experts Used={metrics['experts_used']}")
-        
-        # Re-cluster every 5 rounds (after real features are computed)
-        # Round 1: first recluster with real features (initial was random)
-        if round_num == 1 or round_num % 5 == 0:
+        stats_queue.put(('done', idx, 0, None))
+
+    # Launch all client threads independently
+    threads = []
+    for i, client in enumerate(clients):
+        t = threading.Thread(
+            target=client_training_loop,
+            args=(i, client, train_loaders[i], val_loaders[i]),
+            daemon=True,
+            name=f"Client-{i}"
+        )
+        threads.append(t)
+        t.start()
+
+    # ================================================================
+    # MONITORING LOOP
+    # Collects metrics from clients, triggers periodic evaluation
+    # and reclustering based on wall-clock time (not round counts).
+    # ================================================================
+    clients_done = 0
+    last_eval_time = training_start_time
+    last_recluster_time = training_start_time
+    eval_count = 0
+
+    # First recluster after initial features are computed (~30s)
+    first_recluster_done = False
+
+    print(f"[Async] All {args.num_clients} client threads launched. Monitoring...\n")
+
+    while clients_done < args.num_clients:
+        # Drain metrics from queue (non-blocking)
+        try:
+            msg_type, idx, rnd, data = stats_queue.get(timeout=1.0)
+
+            if msg_type == 'metrics':
+                client_round_counts[idx] = rnd
+                client_latest_metrics[idx] = data
+                if args.verbose or idx == 0:
+                    print(f"  [Client {idx}] Round {rnd}: "
+                          f"Train Loss={data['train_loss']:.4f}, "
+                          f"Train Acc={data['train_acc']:.3f}, "
+                          f"Val Acc={data['val_acc']:.3f}, "
+                          f"Cache={data['cache_size']}, "
+                          f"Experts={data['experts_used']}")
+            elif msg_type == 'error':
+                print(f"  [Client {idx}] Round {rnd} ERROR: {data}")
+            elif msg_type == 'done':
+                clients_done += 1
+                print(f"  [Client {idx}] FINISHED all {args.rounds} rounds "
+                      f"({clients_done}/{args.num_clients} done)")
+
+        except queue.Empty:
+            pass
+
+        now = time.time()
+        elapsed = now - training_start_time
+
+        # First recluster: after ~30s when clients have real features
+        if not first_recluster_done and elapsed > 30:
+            print(f"\n[Async] First recluster at t={elapsed:.0f}s")
             cluster_manager.perform_clustering()
+            first_recluster_done = True
+            last_recluster_time = now
 
-        # Aggregate statistics
-        if len(round_metrics) > 0:
-            avg_train_loss = np.mean([m['train_loss'] for m in round_metrics])
-            avg_train_loss_local = np.mean([m['train_loss_local'] for m in round_metrics])
-            avg_train_loss_moe = np.mean([m['train_loss_moe'] for m in round_metrics])
-            avg_train_acc = np.mean([m['train_acc'] for m in round_metrics])
-            avg_val_loss = np.mean([m['val_loss'] for m in round_metrics])
-            avg_val_acc = np.mean([m['val_acc'] for m in round_metrics])
-            avg_experts_used = np.mean([m['experts_used'] for m in round_metrics])
-            
-            # Global test every 5 rounds (and always on last round)
-            if round_num % 5 == 0 or round_num == args.rounds:
-                test_acc = evaluate_global(clients, test_loader, device)
-                global_stats['test_acc'].append(test_acc)
-            else:
-                test_acc = None
-            
-            # Store statistics
-            global_stats['round'].append(round_num)
-            global_stats['train_loss'].append(avg_train_loss)
-            global_stats['train_acc'].append(avg_train_acc)
-            global_stats['val_loss'].append(avg_val_loss)
-            global_stats['val_acc'].append(avg_val_acc)
-            global_stats['avg_experts_used'].append(avg_experts_used)
+        # Periodic reclustering (time-based)
+        if now - last_recluster_time >= args.recluster_interval:
+            print(f"\n[Async] Reclustering at t={elapsed:.0f}s "
+                  f"(rounds: {client_round_counts})")
+            cluster_manager.perform_clustering()
+            last_recluster_time = now
 
-            round_time = time.time() - round_start_time
-            global_stats['round_time'].append(round_time)
-            
-            # Print round summary
+        # Periodic evaluation (time-based)
+        if now - last_eval_time >= args.eval_interval:
+            eval_count += 1
             print(f"\n{'='*70}")
-            print(f"ROUND {round_num} SUMMARY")
+            print(f"[EVAL {eval_count}] t={elapsed:.0f}s | "
+                  f"Client rounds: {client_round_counts}")
             print(f"{'='*70}")
-            print(f"Avg Train Loss (total): {avg_train_loss:.4f}  [local: {avg_train_loss_local:.4f}, moe: {avg_train_loss_moe:.4f}]")
-            print(f"Average Train Acc:      {avg_train_acc:.3f}")
-            print(f"Average Val Loss:       {avg_val_loss:.4f}")
-            print(f"Average Val Acc:        {avg_val_acc:.3f}")
-            print(f"Avg Experts Used:   {avg_experts_used:.1f}")
-            if 'current_alpha' in round_metrics[0]:
-                print(f"Current Alpha:      {round_metrics[0]['current_alpha']:.3f}")
-            if test_acc is not None:
-                print(f"Global Test Acc:    {test_acc:.3f}")
-            print(f"Round Time:         {round_time:.2f}s")
-            print(f"{'='*70}\n")
-    
-    # Final evaluation
+
+            # Pause all clients at their next epoch boundary
+            # (clients check eval_pause.wait() at start of each epoch)
+            eval_pause.clear()
+            time.sleep(3)  # Wait for in-flight batches to finish (~1-2s each)
+
+            try:
+                # Set eval mode on all clients
+                for client in clients:
+                    if client.body_encoder is not None:
+                        client.body_encoder.eval()
+                        client.head.eval()
+                        client.router.eval()
+
+                # Evaluate
+                test_acc = evaluate_global(clients, test_loader, device)
+
+                # Collect current aggregate metrics
+                active_metrics = [m for m in client_latest_metrics if m is not None]
+                if len(active_metrics) > 0:
+                    avg_train_loss = np.mean([m['train_loss'] for m in active_metrics])
+                    avg_train_acc = np.mean([m['train_acc'] for m in active_metrics])
+                    avg_val_loss = np.mean([m['val_loss'] for m in active_metrics])
+                    avg_val_acc = np.mean([m['val_acc'] for m in active_metrics])
+                    avg_cache = np.mean([m['cache_size'] for m in active_metrics])
+                    avg_experts = np.mean([m['experts_used'] for m in active_metrics])
+                else:
+                    avg_train_loss = avg_train_acc = avg_val_loss = avg_val_acc = 0.0
+                    avg_cache = avg_experts = 0.0
+
+                # Store
+                global_stats['timestamps'].append(elapsed)
+                global_stats['eval_round_counts'].append(list(client_round_counts))
+                global_stats['test_acc'].append(test_acc)
+                global_stats['avg_train_loss'].append(avg_train_loss)
+                global_stats['avg_train_acc'].append(avg_train_acc)
+                global_stats['avg_val_loss'].append(avg_val_loss)
+                global_stats['avg_val_acc'].append(avg_val_acc)
+                global_stats['avg_cache_size'].append(avg_cache)
+                global_stats['avg_experts_used'].append(avg_experts)
+
+                print(f"\n{'~'*70}")
+                print(f"  RESULTS:")
+                print(f"  Global Test Acc:  {test_acc:.4f}")
+                print(f"  Avg Train Loss:   {avg_train_loss:.4f}")
+                print(f"  Avg Train Acc:    {avg_train_acc:.3f}")
+                print(f"  Avg Val Loss:     {avg_val_loss:.4f}")
+                print(f"  Avg Val Acc:      {avg_val_acc:.3f}")
+                print(f"  Avg Cache Size:   {avg_cache:.1f}")
+                print(f"  Avg Experts Used: {avg_experts:.0f}")
+                print(f"{'~'*70}")
+                print(f"{'='*70}\n")
+
+            except Exception as e:
+                print(f"[EVAL {eval_count}] Evaluation failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+            finally:
+                # ALWAYS restore train mode and resume clients
+                for client in clients:
+                    if client.body_encoder is not None:
+                        client.body_encoder.train()
+                        client.head.train()
+                        client.router.train()
+
+                eval_pause.set()  # Resume all client threads
+                last_eval_time = now
+
+    # Wait for all threads to finish
+    for t in threads:
+        t.join(timeout=30)
+
+    # ================================================================
+    # FINAL EVALUATION
+    # ================================================================
     print("\n" + "="*70)
     print("FINAL EVALUATION")
     print("="*70 + "\n")
 
+    # Set eval mode
+    for client in clients:
+        if client.body_encoder is not None:
+            client.body_encoder.eval()
+            client.head.eval()
+            client.router.eval()
+
     final_test_acc = evaluate_global(clients, test_loader, device)
-    global_stats['final_test_acc'] = final_test_acc
     total_training_time = time.time() - training_start_time
+
+    global_stats['final_test_acc'] = final_test_acc
     global_stats['total_training_time'] = total_training_time
-    print(f"Final Global Test Accuracy: {final_test_acc:.3f}")
-    print(f"Total Training Time: {total_training_time:.2f}s ({total_training_time/60:.1f}min)\n")
+
+    print(f"Final Global Test Accuracy: {final_test_acc:.4f}")
+    if len(global_stats['test_acc']) > 0:
+        print(f"Best Test Accuracy:         {max(global_stats['test_acc']):.4f}")
+    print(f"Total Training Time: {total_training_time:.2f}s ({total_training_time/60:.1f}min)")
+    print(f"Client round counts: {client_round_counts}\n")
 
     # Collect per-client final statistics
     client_final_stats = []
-    print("Final Statistics:")
+    print("Final Per-Client Statistics:")
     for i, client in enumerate(clients):
         stats = client.get_statistics()
         client_info = {
@@ -549,14 +682,9 @@ def evaluate_global(
     correct = 0
     total = 0
 
-    # Prepare all clients: set eval mode and build expert heads from cache
+    # Prepare all clients: build expert heads from cache
     client_expert_heads = []
     for client in clients:
-        if client.body_encoder is not None:
-            client.body_encoder.eval()
-            client.head.eval()
-            client.router.eval()
-
         # Build expert heads from this client's cache (once, not per batch)
         expert_heads = {}
         if client.cache.size() > 0:
@@ -569,7 +697,7 @@ def evaluate_global(
                 head_temp.eval()
                 expert_heads[eid] = head_temp
 
-        # Include local head in expert pool (already in eval mode)
+        # Include local head in expert pool
         expert_heads[client.local_expert_id] = client.head
 
         client_expert_heads.append(expert_heads)
@@ -622,8 +750,8 @@ def save_results(args, global_stats):
     Save comprehensive results to a text file in results/ directory
 
     Includes:
-    - Full configuration
-    - Per-round metrics (train loss/acc, val loss/acc, test acc, experts used)
+    - Full configuration (including async/adaptive params)
+    - Per-evaluation metrics (time-based, not round-based)
     - Per-client final statistics
     - Final test accuracy
     """
@@ -635,7 +763,7 @@ def save_results(args, global_stats):
 
     with open(results_file, 'w') as f:
         f.write("=" * 70 + "\n")
-        f.write("FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE - RESULTS\n")
+        f.write("ASYNC FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE - RESULTS\n")
         f.write("=" * 70 + "\n\n")
 
         # Configuration
@@ -644,7 +772,7 @@ def save_results(args, global_stats):
         f.write(f"  Dataset:            {args.dataset}\n")
         f.write(f"  Num Clients:        {args.num_clients}\n")
         f.write(f"  Num Clusters:       {args.num_clusters}\n")
-        f.write(f"  Training Rounds:    {args.rounds}\n")
+        f.write(f"  Rounds (per client):{args.rounds}\n")
         f.write(f"  Partition Method:   {args.partition_method}\n")
         if args.partition_method == 'dirichlet':
             f.write(f"  Dirichlet Alpha:    {args.non_iid_alpha}\n")
@@ -661,35 +789,39 @@ def save_results(args, global_stats):
         f.write(f"  Weight Decay:       {args.weight_decay}\n")
         f.write(f"  LR Decay:           {args.lr_decay}\n")
         f.write(f"  Dropout:            {args.dropout}\n")
+        f.write(f"  Staleness Lambda:   {args.staleness_lambda}\n")
+        f.write(f"  Max Expert Age:     {args.max_expert_age}s\n")
+        f.write(f"  Eval Interval:      {args.eval_interval}s\n")
+        f.write(f"  Recluster Interval: {args.recluster_interval}s\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")
         f.write(f"  Seed:               {args.seed}\n")
         f.write(f"  Device:             {args.device}\n\n")
 
-        # Per-round metrics table
-        f.write("PER-ROUND METRICS\n")
-        f.write("-" * 70 + "\n")
-        f.write(f"{'Round':>6} | {'Train Loss':>10} | {'Train Acc':>9} | "
-                f"{'Val Loss':>8} | {'Val Acc':>7} | {'Test Acc':>8} | {'Experts':>7} | {'Time(s)':>8}\n")
-        f.write("-" * 85 + "\n")
+        # Per-evaluation metrics table
+        f.write("PER-EVALUATION METRICS (time-based)\n")
+        f.write("-" * 90 + "\n")
+        f.write(f"{'Eval':>5} | {'Time(s)':>8} | {'Test Acc':>8} | {'Train Loss':>10} | "
+                f"{'Train Acc':>9} | {'Val Acc':>7} | {'Cache':>5} | {'Experts':>7} | {'Rounds':>30}\n")
+        f.write("-" * 120 + "\n")
 
-        test_acc_idx = 0
-        for i, round_num in enumerate(global_stats['round']):
-            train_loss = global_stats['train_loss'][i]
-            train_acc = global_stats['train_acc'][i]
-            val_loss = global_stats['val_loss'][i]
-            val_acc = global_stats['val_acc'][i]
+        for i in range(len(global_stats.get('timestamps', []))):
+            ts = global_stats['timestamps'][i]
+            test_acc = global_stats['test_acc'][i]
+            train_loss = global_stats['avg_train_loss'][i]
+            train_acc = global_stats['avg_train_acc'][i]
+            val_acc = global_stats['avg_val_acc'][i]
+            cache = global_stats['avg_cache_size'][i]
             experts = global_stats['avg_experts_used'][i]
-            rtime = global_stats['round_time'][i] if i < len(global_stats['round_time']) else 0.0
+            rounds = global_stats['eval_round_counts'][i]
 
-            # Test acc is recorded every 5 rounds and on the last round
-            if (round_num % 5 == 0 or round_num == len(global_stats['round'])) and test_acc_idx < len(global_stats['test_acc']):
-                test_acc_str = f"{global_stats['test_acc'][test_acc_idx]:.4f}"
-                test_acc_idx += 1
-            else:
-                test_acc_str = "   -   "
+            # Summarize round counts
+            min_r = min(rounds)
+            max_r = max(rounds)
+            avg_r = np.mean(rounds)
+            rounds_str = f"min={min_r} avg={avg_r:.0f} max={max_r}"
 
-            f.write(f"{round_num:>6} | {train_loss:>10.4f} | {train_acc:>9.4f} | "
-                    f"{val_loss:>8.4f} | {val_acc:>7.4f} | {test_acc_str:>8} | {experts:>7.1f} | {rtime:>8.2f}\n")
+            f.write(f"{i+1:>5} | {ts:>8.1f} | {test_acc:>8.4f} | {train_loss:>10.4f} | "
+                    f"{train_acc:>9.4f} | {val_acc:>7.4f} | {cache:>5.1f} | {experts:>7.0f} | {rounds_str:>30}\n")
 
         f.write("\n")
 
@@ -699,26 +831,21 @@ def save_results(args, global_stats):
         final_test = global_stats.get('final_test_acc', 0.0)
         f.write(f"  Final Global Test Accuracy: {final_test:.4f}\n")
 
-        # Best metrics
-        if len(global_stats['val_acc']) > 0:
-            best_val_acc = max(global_stats['val_acc'])
-            best_val_round = global_stats['round'][global_stats['val_acc'].index(best_val_acc)]
-            f.write(f"  Best Val Accuracy:          {best_val_acc:.4f} (Round {best_val_round})\n")
-
-        if len(global_stats['test_acc']) > 0:
+        if len(global_stats.get('test_acc', [])) > 0:
             best_test_acc = max(global_stats['test_acc'])
             f.write(f"  Best Test Accuracy:         {best_test_acc:.4f}\n")
 
-        if len(global_stats['train_loss']) > 0:
-            final_train_loss = global_stats['train_loss'][-1]
-            f.write(f"  Final Train Loss:           {final_train_loss:.4f}\n")
+        if len(global_stats.get('avg_val_acc', [])) > 0:
+            best_val_acc = max(global_stats['avg_val_acc'])
+            f.write(f"  Best Avg Val Accuracy:      {best_val_acc:.4f}\n")
+
+        if len(global_stats.get('avg_train_loss', [])) > 0:
+            final_train_loss = global_stats['avg_train_loss'][-1]
+            f.write(f"  Final Avg Train Loss:       {final_train_loss:.4f}\n")
 
         # Timing
         total_time = global_stats.get('total_training_time', 0.0)
         f.write(f"  Total Training Time:        {total_time:.2f}s ({total_time/60:.1f}min)\n")
-        if len(global_stats['round_time']) > 0:
-            avg_round_time = np.mean(global_stats['round_time'])
-            f.write(f"  Avg Round Time:             {avg_round_time:.2f}s\n")
 
         f.write("\n")
 
@@ -726,15 +853,16 @@ def save_results(args, global_stats):
         client_stats = global_stats.get('client_final_stats', [])
         if len(client_stats) > 0:
             f.write("PER-CLIENT FINAL STATISTICS\n")
-            f.write("-" * 70 + "\n")
+            f.write("-" * 85 + "\n")
             f.write(f"{'Client':>7} | {'Trust':>6} | {'Val Acc':>7} | "
-                    f"{'Sent':>5} | {'Recv':>5} | {'Relay':>5} | {'Registered':>10} | "
+                    f"{'Rounds':>6} | {'Sent':>5} | {'Recv':>5} | {'Relay':>5} | {'Registered':>10} | "
                     f"{'Used':>5} | {'Cache':>5}\n")
-            f.write("-" * 70 + "\n")
+            f.write("-" * 85 + "\n")
 
             for cs in client_stats:
                 f.write(f"{cs['client_id']:>7} | {cs['trust_score']:>6.3f} | "
                         f"{cs['validation_accuracy']:>7.3f} | "
+                        f"{cs['rounds_completed']:>6} | "
                         f"{cs['experts_sent']:>5} | {cs['experts_received']:>5} | "
                         f"{cs['experts_relayed']:>5} | "
                         f"{cs['experts_registered']:>10} | "

@@ -1,0 +1,6 @@
+=== Starting 3 experiments at Fri Feb 27 04:29:50 HKT 2026 ===
+=== Experiment 1: non_iid_alpha=0.1 ===
+[Fri Feb 27 04:29:50 HKT 2026] Starting alpha=0.1...
+[Fri Feb 27 11:07:53 HKT 2026] alpha=0.1 DONE
+=== Experiment 2: non_iid_alpha=0.2 ===
+[Fri Feb 27 11:07:53 HKT 2026] Starting alpha=0.2...
