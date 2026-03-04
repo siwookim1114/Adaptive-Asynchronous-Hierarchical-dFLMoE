@@ -45,9 +45,9 @@ def parse_args():
     parser.add_argument('--top_k_experts', type=int, default=3, help='Top-K experts to select')
 
     # Training settings
-    parser.add_argument('--alpha', type=float, default=0.6, help='Hybrid loss weight (local)')
+    parser.add_argument('--alpha', type=float, default=0.5, help='Hybrid loss weight (local)')
     parser.add_argument('--warmup_rounds', type=int, default=10, help='Rounds for alpha warm-up (1.0 to target alpha)')
-    parser.add_argument('--local_epochs', type=int, default=5, help='Local training epochs per round')
+    parser.add_argument('--local_epochs', type=int, default=3, help='Local training epochs per round')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size')
     parser.add_argument('--lr_head', type=float, default=0.001, help='Learning rate for head')
     parser.add_argument('--lr_body', type=float, default=0.001, help='Learning rate for body')
@@ -61,7 +61,9 @@ def parse_args():
                         help='Staleness decay rate for e^(-lambda*t) scoring')
     parser.add_argument('--max_expert_age', type=float, default=300.0,
                         help='Max expert age in seconds before cache eviction')
-    parser.add_argument('--eval_interval', type=float, default=120.0,
+    parser.add_argument('--cross_cluster_interval', type=float, default=60.0,
+                        help='Seconds between cross-cluster expert exchanges')
+    parser.add_argument('--eval_interval', type=float, default=300.0,
                         help='Seconds between global evaluations')
     parser.add_argument('--recluster_interval', type=float, default=150.0,
                         help='Seconds between reclustering')
@@ -270,6 +272,7 @@ def run_federated_learning(args):
     print(f"Dropout: {args.dropout}")
     print(f"Staleness lambda: {args.staleness_lambda}")
     print(f"Max expert age: {args.max_expert_age}s")
+    print(f"Cross-cluster interval: {args.cross_cluster_interval}s")
     print(f"Eval interval: {args.eval_interval}s")
     print(f"Recluster interval: {args.recluster_interval}s")
     print(f"Partition method: {args.partition_method}")
@@ -333,7 +336,8 @@ def run_federated_learning(args):
             learning_rate_router=args.lr_router,
             weight_decay=args.weight_decay,
             lr_decay=args.lr_decay,
-            max_expert_age=args.max_expert_age
+            max_expert_age=args.max_expert_age,
+            cross_cluster_interval=args.cross_cluster_interval
         )
 
         # Create models for this client
@@ -384,6 +388,7 @@ def run_federated_learning(args):
     stats_queue = queue.Queue()       # Clients report metrics here
     eval_pause = threading.Event()    # Cleared during evaluation to pause clients
     eval_pause.set()                  # Not paused initially
+    all_training_done = threading.Event()  # Set when all clients finish — signals keep-alive loops to exit
 
     # Wire eval_pause to all clients so they check it at epoch boundaries
     for client in clients:
@@ -415,6 +420,13 @@ def run_federated_learning(args):
         args.rounds local rounds at its own pace, with no synchronization
         barrier with other clients. Expert packages arrive asynchronously
         via the transport layer during training.
+
+        After training completes, the client enters a keep-alive phase:
+        it periodically re-shares its final (best) expert package so that
+        peers' caches don't evict it due to staleness. This continues
+        until all clients have finished training. Without keep-alive,
+        fast-finishing clients' experts get evicted, degrading the expert
+        pool for still-training clients.
         """
         for local_round in range(1, args.rounds + 1):
             # eval_pause is checked at each epoch boundary inside
@@ -433,6 +445,27 @@ def run_federated_learning(args):
                 stats_queue.put(('error', idx, local_round, str(e)))
 
         stats_queue.put(('done', idx, 0, None))
+
+        # Keep-alive: re-share final expert every 30s to prevent intra-cluster eviction.
+        # The expert timestamp is refreshed on each intra-cluster share, so cluster
+        # peers' caches keep it alive until all training completes.
+        #
+        # allow_cross_cluster=False is intentional: after a client finishes its
+        # training rounds, its expert is frozen (no more gradient updates). Continuing
+        # to force cross-cluster exchange every 30s would refresh timestamps on
+        # post-training experts, defeating max_age eviction and locking the cache at
+        # 9/9. By stopping cross-cluster here, post-training cross-cluster experts
+        # age out naturally — restoring staleness discrimination and allowing the
+        # router to prefer fresher, still-training intra-cluster experts.
+        # Intra-cluster sharing is unaffected (no knowledge loss within cluster).
+        reshare_interval = 30  # seconds
+        while not all_training_done.wait(timeout=reshare_interval):
+            try:
+                eval_pause.wait()  # Pause during evaluation
+                client._drain_pending_registrations()
+                client.share_expert(force_all_targets=True, allow_cross_cluster=False)
+            except Exception as e:
+                print(f"  [Client {idx}] Keep-alive share error: {e}")
 
     # Launch all client threads independently
     threads = []
@@ -579,9 +612,12 @@ def run_federated_learning(args):
                 eval_pause.set()  # Resume all client threads
                 last_eval_time = now
 
-    # Wait for all threads to finish
+    # Signal keep-alive loops to exit now that all clients finished training
+    all_training_done.set()
+
+    # Wait for all threads to finish (keep-alive loops exit within 30s)
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=60)
 
     # ================================================================
     # FINAL EVALUATION
@@ -791,6 +827,7 @@ def save_results(args, global_stats):
         f.write(f"  Dropout:            {args.dropout}\n")
         f.write(f"  Staleness Lambda:   {args.staleness_lambda}\n")
         f.write(f"  Max Expert Age:     {args.max_expert_age}s\n")
+        f.write(f"  Cross-Cluster Int:  {args.cross_cluster_interval}s\n")
         f.write(f"  Eval Interval:      {args.eval_interval}s\n")
         f.write(f"  Recluster Interval: {args.recluster_interval}s\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")

@@ -49,7 +49,8 @@ class ClientNode:
         learning_rate_router: float = 0.001,
         weight_decay: float = 1e-4,
         lr_decay: float = 0.98,
-        max_expert_age: float = 300.0
+        max_expert_age: float = 300.0,
+        cross_cluster_interval: float = 60.0
     ):
         self.client_id = client_id
         self.local_expert_id = int(client_id.split('_')[-1]) if '_' in client_id else int(client_id)
@@ -97,8 +98,9 @@ class ClientNode:
         self.representative_features = torch.randn(feature_dim)
         
         # Communication settings
-        self.cluster_exchange_interval = 1
-        self.cross_cluster_exchange_interval = 5
+        self.cluster_exchange_interval = 1                              # Intra-cluster: every local round (new knowledge → share immediately)
+        self.cross_cluster_exchange_seconds = cross_cluster_interval    # Cross-cluster: wall-clock time based (consistent with async design)
+        self._last_cross_cluster_time = time.time()                      # Timestamp of last cross-cluster exchange (init to now so round-1 doesn't fire cross-cluster before any training)
         self.current_round = 0
         
         # Track which FST keys have been added to optimizer_router
@@ -365,18 +367,41 @@ class ClientNode:
             num_samples=self.num_samples
         )
     
-    def share_expert(self):
+    def share_expert(self, force_all_targets: bool = False, allow_cross_cluster: bool = True):
+        """Share this client's expert package with peers.
+
+        Communication strategy:
+        - Intra-cluster: every local round (new knowledge → share immediately)
+        - Cross-cluster: wall-clock time based (every cross_cluster_exchange_seconds).
+          This is consistent with the async design where clients train at
+          different speeds. A fast client shouldn't flood cross-cluster just
+          because it completes rounds faster.
+
+        Args:
+            force_all_targets: If True, force intra-cluster share unconditionally
+                (bypasses round-modulo check). Note: intra-cluster already fires
+                every call when cluster_exchange_interval=1, so this only matters
+                for larger interval values.
+            allow_cross_cluster: If False, skip cross-cluster exchange entirely.
+                Used by keep-alive loop — after training completes, cross-cluster
+                sharing should stop so that post-training experts age out naturally
+                via max_age eviction, restoring staleness discrimination.
+        """
         package = self.create_expert_package()
         targets = self.cluster_manager.get_communication_targets(self.client_id)
         experts_sent = 0
+        now = time.time()
 
-        if self.current_round % self.cluster_exchange_interval == 0:
+        # Intra-cluster: every round (round-based — share new knowledge immediately)
+        if force_all_targets or self.current_round % self.cluster_exchange_interval == 0:
             cluster_peers = targets['cluster_peers']
             if len(cluster_peers) > 0:
                 num_sent = self.transport.broadcast(cluster_peers, 'expert_package', package)
                 experts_sent += num_sent
 
-        if self.current_round % self.cross_cluster_exchange_interval == 0:
+        # Cross-cluster: wall-clock time based (skipped during keep-alive)
+        time_since_last = now - self._last_cross_cluster_time
+        if allow_cross_cluster and (force_all_targets or time_since_last >= self.cross_cluster_exchange_seconds):
             if self.cluster_manager.is_cluster_head(self.client_id):
                 cluster_heads = targets['cluster_heads']
                 if len(cluster_heads) > 0:
@@ -395,6 +420,8 @@ class ClientNode:
                             # This is an intra-cluster member's expert — forward it
                             num_sent = self.transport.broadcast(cluster_heads, 'expert_package', cached_pkg)
                             experts_sent += num_sent
+
+                    self._last_cross_cluster_time = now
 
         with self._stats_lock:
             self._stats['experts_sent'] += experts_sent
