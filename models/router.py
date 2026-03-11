@@ -98,6 +98,7 @@ class Router(nn.Module):
         temperature: float = 1.0,
         top_k: int = 3,
         staleness_lambda: float = 0.005,
+        staleness_floor: float = 0.1,
         similarity_type: str = "cosine",
         use_learned_gating: bool = True
     ):
@@ -110,6 +111,7 @@ class Router(nn.Module):
             temperature: Temperature for softmax (higher = more uniform) for routing
             top_k: Number of top experts to select
             staleness_lambda: Lambda parameter for e^(-lambda * delta_t)
+            staleness_floor: Minimum staleness factor to prevent complete expert suppression
             similarity_type: Type of similarity ("cosine" or "kl")
             use_learned_gating: Enable learnable gating network
         """
@@ -121,6 +123,7 @@ class Router(nn.Module):
         self.temperature = temperature
         self.top_k = min(top_k, num_experts)
         self.staleness_lambda = staleness_lambda
+        self.staleness_floor = staleness_floor
         self.similarity_type = similarity_type
         self.use_learned_gating = use_learned_gating
 
@@ -273,17 +276,23 @@ class Router(nn.Module):
     
     def compute_staleness_factor(self, expert_id: int) -> float:
         """
-        Compute e^(-lambda * delta_t{ij}): Staleness decay factor
+        Compute max(floor, e^(-lambda * delta_t{ij})): Staleness decay factor
+
+        The floor prevents complete suppression of stale experts during training,
+        ensuring the router can still learn from cross-cluster experts even when
+        they haven't been refreshed recently. Fresh experts still score ~8x higher
+        than floor-clamped ones (e.g., 0.86 vs 0.1), preserving the preference
+        for fresher experts.
 
         Args:
             expert_id: Expert ID
 
         Returns:
-            staleness_factor: Decay factor in [0, 1]
+            staleness_factor: Decay factor in [floor, 1]
         """
         metadata = self.expert_metadata[expert_id]
         delta_t = metadata.get_staleness()
-        return math.exp(-self.staleness_lambda * delta_t)
+        return max(self.staleness_floor, math.exp(-self.staleness_lambda * delta_t))
     
     def compute_base_score(self, trust: float, similarity: float, staleness_factor: float) -> float:
         """

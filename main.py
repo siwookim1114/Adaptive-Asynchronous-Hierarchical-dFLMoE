@@ -59,6 +59,8 @@ def parse_args():
     # Async and adaptive settings
     parser.add_argument('--staleness_lambda', type=float, default=0.005,
                         help='Staleness decay rate for e^(-lambda*t) scoring')
+    parser.add_argument('--staleness_floor', type=float, default=0.1,
+                        help='Minimum staleness factor to prevent complete expert suppression during training')
     parser.add_argument('--max_expert_age', type=float, default=300.0,
                         help='Max expert age in seconds before cache eviction')
     parser.add_argument('--cross_cluster_interval', type=float, default=60.0,
@@ -80,6 +82,8 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda', help='Device (cuda/cpu)')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
+    parser.add_argument('--sync', action='store_true',
+                        help='Use synchronous training (round barrier) instead of async')
 
     return parser.parse_args()
 
@@ -238,6 +242,192 @@ def create_models(feature_dim: int, num_classes: int, device: torch.device, data
     return body_encoder, head
 
 
+def run_sync_training(args, clients, train_loaders, val_loaders, test_loader,
+                      cluster_manager, criterion, device, training_start_time):
+    """
+    Synchronous federated learning with round barrier.
+
+    All clients train round R concurrently (ThreadPoolExecutor), then a
+    barrier waits for all to finish before proceeding to round R+1.
+    Evaluation every eval_every rounds. Reclustering every recluster_every rounds.
+    """
+    import concurrent.futures
+
+    print("\n" + "="*70)
+    print("STARTING SYNCHRONOUS TRAINING")
+    print("="*70 + "\n")
+
+    eval_every = 5       # Evaluate every N rounds
+    recluster_every = 3  # Recluster every N rounds
+
+    global_stats = {
+        'timestamps': [],
+        'eval_round_counts': [],
+        'test_acc': [],
+        'avg_train_loss': [],
+        'avg_train_acc': [],
+        'avg_val_loss': [],
+        'avg_val_acc': [],
+        'avg_cache_size': [],
+        'avg_experts_used': [],
+    }
+
+    for round_num in range(1, args.rounds + 1):
+        print(f"\n{'='*70}")
+        print(f"ROUND {round_num}/{args.rounds}")
+        print(f"{'='*70}")
+
+        # Train all clients concurrently with barrier
+        round_metrics = []
+
+        def train_one_client(idx, client, tl, vl):
+            try:
+                metrics = client.train_round(
+                    train_loader=tl, val_loader=vl,
+                    criterion=criterion, device=device, use_experts=True
+                )
+                return idx, metrics, None
+            except Exception as e:
+                return idx, None, e
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.num_clients) as executor:
+            futures = [
+                executor.submit(train_one_client, i, clients[i], train_loaders[i], val_loaders[i])
+                for i in range(len(clients))
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                idx, metrics, error = future.result()
+                if error:
+                    print(f"  Client {idx} error: {error}")
+                elif metrics:
+                    round_metrics.append(metrics)
+                    if args.verbose or idx == 0:
+                        print(f"  Client {idx}: "
+                              f"Train Loss={metrics['train_loss']:.4f}, "
+                              f"Train Acc={metrics['train_acc']:.3f}, "
+                              f"Val Acc={metrics['val_acc']:.3f}, "
+                              f"Cache={metrics['cache_size']}, "
+                              f"Experts={metrics['experts_used']}")
+
+        # Recluster periodically
+        if round_num == 1 or round_num % recluster_every == 0:
+            cluster_manager.perform_clustering()
+
+        # Aggregate metrics
+        if len(round_metrics) > 0:
+            avg_train_loss = np.mean([m['train_loss'] for m in round_metrics])
+            avg_train_acc = np.mean([m['train_acc'] for m in round_metrics])
+            avg_val_loss = np.mean([m['val_loss'] for m in round_metrics])
+            avg_val_acc = np.mean([m['val_acc'] for m in round_metrics])
+            avg_cache = np.mean([m['cache_size'] for m in round_metrics])
+            avg_experts = np.mean([m['experts_used'] for m in round_metrics])
+        else:
+            avg_train_loss = avg_train_acc = avg_val_loss = avg_val_acc = 0.0
+            avg_cache = avg_experts = 0.0
+
+        # Evaluate periodically
+        if round_num % eval_every == 0 or round_num == args.rounds:
+            elapsed = time.time() - training_start_time
+
+            # Disable staleness during eval (same as async)
+            saved_lambdas = {}
+            for i, client in enumerate(clients):
+                if client.body_encoder is not None:
+                    client.body_encoder.eval()
+                    client.head.eval()
+                    client.router.eval()
+                    saved_lambdas[i] = client.router.staleness_lambda
+                    client.router.staleness_lambda = 0.0
+
+            test_acc = evaluate_global(clients, test_loader, device)
+
+            # Restore
+            for i, client in enumerate(clients):
+                if client.body_encoder is not None:
+                    client.body_encoder.train()
+                    client.head.train()
+                    client.router.train()
+                    if i in saved_lambdas:
+                        client.router.staleness_lambda = saved_lambdas[i]
+
+            round_counts = [round_num] * args.num_clients
+            global_stats['timestamps'].append(elapsed)
+            global_stats['eval_round_counts'].append(round_counts)
+            global_stats['test_acc'].append(test_acc)
+            global_stats['avg_train_loss'].append(avg_train_loss)
+            global_stats['avg_train_acc'].append(avg_train_acc)
+            global_stats['avg_val_loss'].append(avg_val_loss)
+            global_stats['avg_val_acc'].append(avg_val_acc)
+            global_stats['avg_cache_size'].append(avg_cache)
+            global_stats['avg_experts_used'].append(avg_experts)
+
+            print(f"\n  [EVAL Round {round_num}] t={elapsed:.0f}s")
+            print(f"  Global Test Acc:  {test_acc:.4f}")
+            print(f"  Avg Train Loss:   {avg_train_loss:.4f}")
+            print(f"  Avg Val Acc:      {avg_val_acc:.3f}")
+            print(f"  Avg Cache Size:   {avg_cache:.1f}")
+
+    # ================================================================
+    # FINAL EVALUATION
+    # ================================================================
+    print("\n" + "="*70)
+    print("FINAL EVALUATION")
+    print("="*70 + "\n")
+
+    for client in clients:
+        if client.body_encoder is not None:
+            client.body_encoder.eval()
+            client.head.eval()
+            client.router.eval()
+            client.router.staleness_lambda = 0.0
+
+    final_test_acc = evaluate_global(clients, test_loader, device)
+    total_training_time = time.time() - training_start_time
+
+    global_stats['final_test_acc'] = final_test_acc
+    global_stats['total_training_time'] = total_training_time
+
+    print(f"Final Global Test Accuracy: {final_test_acc:.4f}")
+    if len(global_stats['test_acc']) > 0:
+        print(f"Best Test Accuracy:         {max(global_stats['test_acc']):.4f}")
+    print(f"Total Training Time: {total_training_time:.2f}s ({total_training_time/60:.1f}min)")
+
+    # Collect per-client stats
+    client_final_stats = []
+    print("\nFinal Per-Client Statistics:")
+    for i, client in enumerate(clients):
+        stats = client.get_statistics()
+        client_info = {
+            'client_id': i,
+            'rounds_completed': stats['rounds_completed'],
+            'experts_sent': stats['experts_sent'],
+            'experts_received': stats['experts_received'],
+            'experts_relayed': stats['experts_relayed'],
+            'experts_registered': stats['experts_registered'],
+            'experts_used': stats['experts_used'],
+            'trust_score': client.trust_score,
+            'validation_accuracy': client.validation_accuracy,
+            'cache_size': stats['cache']['size']
+        }
+        client_final_stats.append(client_info)
+        print(f"\nClient {i}:")
+        print(f"  Rounds: {stats['rounds_completed']}")
+        print(f"  Trust Score: {client.trust_score:.3f}")
+        print(f"  Cache Size: {stats['cache']['size']}")
+
+    global_stats['client_final_stats'] = client_final_stats
+
+    # Shutdown
+    print("\n" + "="*70)
+    print("SHUTTING DOWN")
+    print("="*70 + "\n")
+    for client in clients:
+        client.shutdown()
+    print("Training complete!\n")
+
+    return global_stats
+
+
 def run_federated_learning(args):
     """
     Main federated learning orchestration with TRUE asynchronous training.
@@ -253,7 +443,8 @@ def run_federated_learning(args):
         args: Command line arguments
     """
     print("\n" + "="*70)
-    print("ASYNC FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE")
+    mode_str = "SYNC" if args.sync else "ASYNC"
+    print(f"{mode_str} FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE")
     print("="*70 + "\n")
 
     # Setup
@@ -271,6 +462,7 @@ def run_federated_learning(args):
     print(f"LR decay: {args.lr_decay}")
     print(f"Dropout: {args.dropout}")
     print(f"Staleness lambda: {args.staleness_lambda}")
+    print(f"Staleness floor: {args.staleness_floor}")
     print(f"Max expert age: {args.max_expert_age}s")
     print(f"Cross-cluster interval: {args.cross_cluster_interval}s")
     print(f"Eval interval: {args.eval_interval}s")
@@ -327,6 +519,7 @@ def run_federated_learning(args):
             num_experts=args.num_clients,
             max_cache_size=args.num_clients,
             staleness_lambda=args.staleness_lambda,
+            staleness_floor=args.staleness_floor,
             top_k_experts=args.top_k_experts,
             alpha=args.alpha,
             warmup_rounds=args.warmup_rounds,
@@ -374,6 +567,15 @@ def run_federated_learning(args):
 
     # Loss function
     criterion = nn.CrossEntropyLoss()
+
+    # ================================================================
+    # DISPATCH: SYNC or ASYNC training
+    # ================================================================
+    if args.sync:
+        return run_sync_training(
+            args, clients, train_loaders, val_loaders, test_loader,
+            cluster_manager, criterion, device, training_start_time=time.time()
+        )
 
     # ================================================================
     # TRUE ASYNCHRONOUS TRAINING
@@ -544,18 +746,25 @@ def run_federated_learning(args):
                   f"Client rounds: {client_round_counts}")
             print(f"{'='*70}")
 
+            saved_lambdas = {}
             try:
                 # Pause all clients at their next epoch boundary
                 # (clients check eval_pause.wait() at start of each epoch)
                 # INSIDE try so that Ctrl+C during sleep still triggers finally→set()
                 eval_pause.clear()
                 time.sleep(3)  # Wait for in-flight batches to finish (~1-2s each)
-                # Set eval mode on all clients
-                for client in clients:
+                # Set eval mode on all clients and disable staleness for evaluation.
+                # Staleness e^(-λt) is a training signal (prefer fresh experts for
+                # gradient updates). During evaluation, expert weights don't degrade
+                # with time — trust, similarity, and learned gating are sufficient.
+                # This is analogous to disabling dropout during evaluation.
+                for i, client in enumerate(clients):
                     if client.body_encoder is not None:
                         client.body_encoder.eval()
                         client.head.eval()
                         client.router.eval()
+                        saved_lambdas[i] = client.router.staleness_lambda
+                        client.router.staleness_lambda = 0.0
 
                 # Evaluate
                 test_acc = evaluate_global(clients, test_loader, device)
@@ -602,12 +811,14 @@ def run_federated_learning(args):
                 traceback.print_exc()
 
             finally:
-                # ALWAYS restore train mode and resume clients
-                for client in clients:
+                # ALWAYS restore train mode, staleness lambda, and resume clients
+                for i, client in enumerate(clients):
                     if client.body_encoder is not None:
                         client.body_encoder.train()
                         client.head.train()
                         client.router.train()
+                        if i in saved_lambdas:
+                            client.router.staleness_lambda = saved_lambdas[i]
 
                 eval_pause.set()  # Resume all client threads
                 last_eval_time = now
@@ -626,12 +837,13 @@ def run_federated_learning(args):
     print("FINAL EVALUATION")
     print("="*70 + "\n")
 
-    # Set eval mode
+    # Set eval mode and disable staleness (same rationale as periodic evals)
     for client in clients:
         if client.body_encoder is not None:
             client.body_encoder.eval()
             client.head.eval()
             client.router.eval()
+            client.router.staleness_lambda = 0.0
 
     final_test_acc = evaluate_global(clients, test_loader, device)
     total_training_time = time.time() - training_start_time
@@ -756,12 +968,13 @@ def evaluate_global(
                 features = client.body_encoder(x)
 
                 expert_heads = client_expert_heads[i]
-                if len(expert_heads) > 0:
+                if len(expert_heads) > 0 and client.alpha < 1.0:
                     # Pure MoE: router selects from all experts including local
                     predictions = client.router.forward_moe(
                         features, expert_heads, k=client.top_k_experts
                     )
                 else:
+                    # Local head only (alpha=1.0 ablation or no experts available)
                     predictions = client.head(features)
 
                 probs = torch.softmax(predictions, dim=1)
@@ -799,7 +1012,8 @@ def save_results(args, global_stats):
 
     with open(results_file, 'w') as f:
         f.write("=" * 70 + "\n")
-        f.write("ASYNC FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE - RESULTS\n")
+        mode_str = "SYNC" if args.sync else "ASYNC"
+        f.write(f"{mode_str} FEDERATED LEARNING WITH ADAPTIVE HIERARCHICAL MoE - RESULTS\n")
         f.write("=" * 70 + "\n\n")
 
         # Configuration
@@ -826,10 +1040,12 @@ def save_results(args, global_stats):
         f.write(f"  LR Decay:           {args.lr_decay}\n")
         f.write(f"  Dropout:            {args.dropout}\n")
         f.write(f"  Staleness Lambda:   {args.staleness_lambda}\n")
+        f.write(f"  Staleness Floor:    {args.staleness_floor}\n")
         f.write(f"  Max Expert Age:     {args.max_expert_age}s\n")
         f.write(f"  Cross-Cluster Int:  {args.cross_cluster_interval}s\n")
         f.write(f"  Eval Interval:      {args.eval_interval}s\n")
         f.write(f"  Recluster Interval: {args.recluster_interval}s\n")
+        f.write(f"  Mode:               {'Synchronous' if args.sync else 'Asynchronous'}\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")
         f.write(f"  Seed:               {args.seed}\n")
         f.write(f"  Device:             {args.device}\n\n")

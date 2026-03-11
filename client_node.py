@@ -40,6 +40,7 @@ class ClientNode:
         num_experts: int = 10,
         max_cache_size: int = 50,
         staleness_lambda: float = 0.005,
+        staleness_floor: float = 0.1,
         top_k_experts: int = 3,
         alpha: float = 0.5,
         warmup_rounds: int = 10,
@@ -79,6 +80,7 @@ class ClientNode:
             num_experts=num_experts,
             top_k=top_k_experts,
             staleness_lambda=staleness_lambda,
+            staleness_floor=staleness_floor,
             use_learned_gating=True
         )
         
