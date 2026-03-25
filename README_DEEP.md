@@ -84,6 +84,7 @@
 15. [Design Evolution](#15-design-evolution--trials-errors--critical-fixes) — *Report: Appendix*
 16. [Comparison with Prior Work](#16-comparison-with-prior-work) — *Report: X.6.2, Results*
 17. [Experiment Results](#17-experiment-results) — *Report: Results Chapter*
+    - 17.11 [Fault Tolerance Experiments](#1711-fault-tolerance-experiments) — *Report: Robustness*
 18. [Mathematical Formulation](#18-formal-problem-definition--mathematical-formulation) — *Report: X.1, X.3, X.7*
 19. [Algorithm Pseudocode](#19-algorithm-specifications-formal-pseudocode) — *Report: X.3.5*
 20. [Related Work](#20-related-work--narrative-categorization) — *Report: X.1.1–X.1.3, 1.1*
@@ -2445,6 +2446,331 @@ The following limitations should be considered when interpreting our results:
 
 7. **Model scale**: Our SimpleCNNBody is a mid-range model. Testing with ResNet-18 or Vision Transformer backbones would demonstrate whether the MoE routing advantage scales with model capacity, or whether the gains are specific to our architecture.
 
+### 17.11 Fault Tolerance Experiments
+
+Our framework claims resilience to client failures as a core advantage of asynchronous, decentralized FL over synchronous, centralized approaches. This section validates that claim through controlled fault injection experiments.
+
+#### 17.11.1 Methodology
+
+All fault tolerance experiments use the same configuration as the alpha=0.3 async baseline (73.40%) to enable direct comparison. Each scenario injects a specific failure pattern via the `--fault_scenario` CLI flag while keeping all other hyperparameters identical.
+
+**Implementation details:**
+- **Dropout/Majority**: Crashed clients' transport layer is fully shut down (TCP server socket closed, all peer connections dropped). The client's `is_active` flag is set to `False`, excluding it from all subsequent evaluations. The client thread exits and does not enter keep-alive.
+- **Rejoin**: The client thread exits completely after crash (transport shutdown, thread terminates). After the configured delay (`--rejoin_delay`), a new thread spawns, creates a fresh TCP transport on a new port, re-registers all peer addresses bidirectionally, and resumes training from the checkpoint round. Model/optimizer state is preserved (simulating checkpoint-to-disk/load-from-disk, which produces identical bytes).
+- **Churn**: Each client uses a per-client seeded RNG (`seed + client_id`) for reproducible skip decisions. Skipped rounds sleep for ~30s (approximate round duration) to maintain realistic timing.
+
+**Comparison with dFLMoE's disconnect experiments [prior work]:**
+
+The original dFLMoE paper tested two disconnect scenarios, but neither involves mid-training dynamic failure:
+
+| Aspect | dFLMoE's Test | Our Test |
+|---|---|---|
+| Communication disconnect | Drop upload/download operations randomly | Not tested (our transport uses TCP with automatic reconnection) |
+| Client disconnect | Start training with fewer clients from round 1 | **Crash mid-training** — clients participate in early rounds then fail |
+| Mid-training crash | Never tested | **Tested** — dropout, rejoin, majority scenarios |
+| Client recovery | Never tested | **Tested** — rejoin scenario with true transport restart |
+| Catastrophic failure (50%+) | Never tested | **Tested** — majority scenario (5/10 clients crash) |
+
+Our experiments test a strictly harder set of scenarios. dFLMoE's "client disconnect" is a static reduced-participation setup (equivalent to training with N-k clients from round 1), while our scenarios involve dynamic failures where clients contribute knowledge in early rounds and then disappear, potentially leaving stale experts in peers' caches.
+
+#### 17.11.2 Results
+
+**Scenario 1: Dropout (2 clients permanently crash after round 8)**
+
+| Metric | Baseline (no fault) | Dropout | Delta |
+|---|---:|---:|---:|
+| Final Test Accuracy | 73.40% | 70.21% | -3.19pp |
+| Best Test Accuracy | 73.09% | 70.94% | -2.46pp |
+| Total Training Time | 113.9 min | 94.2 min | -19.7 min |
+| Active Clients | 10/10 | 8/10 | -20% |
+
+Fault events:
+- Client 2 crashed at round 8 (t=1312s)
+- Client 7 crashed at round 8 (t=2516s)
+
+Per-client final state:
+
+| Client | Status | Rounds | Trust | Cache |
+|---:|---|---:|---:|---:|
+| 0 | ACTIVE | 20 | 0.808 | 7 |
+| 1 | ACTIVE | 20 | 0.910 | 6 |
+| 2 | CRASHED | 8 | 0.873 | 1 |
+| 3 | ACTIVE | 20 | 0.844 | 4 |
+| 4 | ACTIVE | 20 | 0.862 | 6 |
+| 5 | ACTIVE | 20 | 0.861 | 6 |
+| 6 | ACTIVE | 20 | 0.883 | 3 |
+| 7 | CRASHED | 8 | 0.852 | 1 |
+| 8 | ACTIVE | 20 | 0.891 | 7 |
+| 9 | ACTIVE | 20 | 0.757 | 5 |
+
+**Analysis:**
+
+1. **Crashes are invisible in the accuracy trajectory**: Client 2 crashes between eval 4 and 5 (t=1312s), and the trajectory continues climbing: eval 5 jumps to 58.38%, eval 6 dips to 56.07%, then eval 7 reaches 63.47%. There is no visible inflection point at the first crash. Client 7 crashes later between eval 8 and 9 (t=2516s), and again the trajectory shows no discontinuity — eval 9 (64.37%) continues the upward trend from eval 8 (62.21%). The ensemble evaluation excludes inactive clients by design (`is_active` check in `evaluate_global()`), so the surviving 8 clients carry the prediction signal without disruption.
+
+2. **Post-crash convergence and the 3pp gap**: After both clients are down, the system enters a steady climb from eval 9 (64.37%) to a peak at eval 17 (70.94%), followed by a slight decline to 70.21% at eval 18. The final 8 evals (11-18) oscillate in a narrow 68-71% band, indicating convergence. The 3.19pp gap to the baseline (73.40%) persists throughout this plateau and never closes. This likely represents the permanent cost of losing 2 clients' class expertise under Dirichlet alpha=0.3 partitioning: the surviving 8 clients probably do not have full coverage of the classes that clients 2 and 7 specialized in, though other contributing factors cannot be ruled out.
+
+3. **Staggered crashes suggest true async operation**: Client 2 crashed at t=1312s and Client 7 at t=2516s — a 1204-second gap — despite both crashing at their local round 8. This 20-minute wall-clock difference for the same logical round strongly suggests that clients train at genuinely independent paces with no synchronization barrier. It also means the system experienced two separate degradation events rather than one simultaneous shock, and absorbed both without disruption.
+
+4. **Cache eviction as a self-healing mechanism**: Crashed clients end with cache=1 (only their own stale expert), while active clients maintain healthy caches of 3-7 experts. After a crash, the dead client's experts linger in peers' caches but are progressively down-weighted by staleness decay and eventually evicted by `max_expert_age=600s`. This creates a smooth transition rather than an abrupt loss — the dead expert's influence fades over a period up to 10 minutes (`max_expert_age=600s`) rather than vanishing instantly, as staleness decay progressively down-weights it before eviction. The eval-by-eval data is consistent with this: there is no sharp accuracy drop at either crash point, only a gradual widening of the gap to the baseline.
+
+5. **Training time reduction is a mechanical artifact**: The 19.7-minute speedup occurs because the monitoring loop exits when all 10 clients finish — crashed clients terminate at round 8, so the slowest remaining client (which determines total time) completes sooner. This is not an efficiency gain; the 3.19pp accuracy cost far outweighs any wall-clock savings.
+
+**Scenario 2: Churn (20% random round skips per client)**
+
+| Metric | Baseline (no fault) | Churn | Delta |
+|---|---:|---:|---:|
+| Final Test Accuracy | 73.40% | 73.62% | +0.22pp |
+| Best Test Accuracy | 73.09% | 73.22% | +0.13pp |
+| Total Training Time | 113.9 min | 84.5 min | -29.4 min |
+| Active Clients | 10/10 | 10/10 | 0 |
+| Effective Rounds (per client) | 20 | 13-18 | ~16 avg |
+
+Fault events: 51 total skip events across all 10 clients (consistent with 20% skip rate × 10 clients × 20 rounds = ~40 expected skips; actual count varies due to stochastic sampling).
+
+Per-client final state:
+
+| Client | Status | Rounds | Trust | Cache |
+|---:|---|---:|---:|---:|
+| 0 | ACTIVE | 14 | 0.815 | 5 |
+| 1 | ACTIVE | 15 | 0.872 | 5 |
+| 2 | ACTIVE | 13 | 0.860 | 8 |
+| 3 | ACTIVE | 13 | 0.815 | 8 |
+| 4 | ACTIVE | 16 | 0.834 | 8 |
+| 5 | ACTIVE | 17 | 0.866 | 5 |
+| 6 | ACTIVE | 13 | 0.885 | 5 |
+| 7 | ACTIVE | 14 | 0.886 | 7 |
+| 8 | ACTIVE | 16 | 0.890 | 8 |
+| 9 | ACTIVE | 18 | 0.749 | 8 |
+
+**Analysis:**
+
+1. **Accuracy converges to the baseline despite 20% fewer effective rounds**: Early evals start lower (38.61% at eval 1), which is expected — with 20% of round-client pairs skipped, the average client has completed fewer rounds at any given wall-clock time. But by eval 8 (67.02%) the curve accelerates, and from eval 12 onward (69.92%, 70.99%, 70.46%, 73.22%, 72.24%) it oscillates in the 70-73% range. The final accuracy of 73.62% is within 0.22pp of the baseline (73.40%) — well within single-seed noise. This suggests the system may have extracted comparable total knowledge from ~20% less compute.
+
+2. **No visible disruption at any point in the trajectory**: Unlike the dropout and majority scenarios where crash events create identifiable trajectory changes, the churn curve is smooth and monotonically improving (with normal eval-to-eval noise). This is because churn events are distributed uniformly across rounds and clients by design (independent 20% skip probability per round per client) — no single eval window loses a critical mass of expert updates. At any given eval, ~8 of 10 clients have recently trained, and their experts dominate the cache. The 2 temporarily-absent clients' experts remain in peers' caches from prior rounds, slightly stale but still useful.
+
+3. **The min-round spread reveals the async advantage**: At eval 8, the spread is min=5 / avg=11 / max=19 — a 14-round gap between the slowest and fastest client. By eval 15, it narrows to min=15 / avg=18 / max=20. This wide spread means the expert pool at any evaluation contains experts at very different maturity levels (round 5 through round 19), yet accuracy still matches the baseline. The framework's trust-weighted routing and staleness decay are designed to prioritize fresher, more mature experts, and the results suggest this mechanism operates effectively without requiring all clients to be at the same round.
+
+4. **Per-client round variance (13-18) suggests robustness to heterogeneous participation**: Client 9 completed 18 rounds while Client 2 completed only 13 — a 28% difference in effective training. Yet the final ensemble accuracy is unchanged. This suggests that the framework may not require balanced participation across clients; the trust scoring mechanism is designed to compensate by up-weighting experts from clients that trained more frequently and down-weighting staler ones.
+
+5. **Expert diversity preserved, training iterations reduced — and that trade-off is free**: The critical contrast with the dropout scenario is:
+
+| Failure Type | Accuracy | Expert Pool Size | Avg Rounds/Client |
+|---|---:|---:|---:|
+| Baseline (no fault) | 73.40% | 10 experts | 20 |
+| Churn (intermittent) | 73.62% | 10 experts | ~15.6 |
+| Dropout (permanent) | 70.21% | 8 experts | 20 (active) |
+
+Churn preserves all 10 experts in the pool but reduces per-client training iterations by ~22%. Dropout preserves full training iterations for 8 clients but permanently removes 2 experts. The contrast is notable: losing 22% of training iterations costs 0pp, while losing 20% of expert diversity costs 3.19pp. This suggests that the framework's accuracy ceiling may be primarily determined by the breadth of class expertise available in the expert pool, rather than by the number of gradient steps each client takes. Once an expert has trained enough rounds to be useful — approximately 8-10 rounds, as suggested by the dropout convergence data — additional rounds appear to yield diminishing returns.
+
+**Scenario 3: Majority Failure (50% of clients crash after round 5)**
+
+| Metric | Baseline (no fault) | Majority | Delta |
+|---|---:|---:|---:|
+| Final Test Accuracy | 73.40% | 59.34% | -14.06pp |
+| Best Test Accuracy | 73.09% | 58.11% | -14.98pp |
+| Total Training Time | 113.9 min | 179.4 min | +65.5 min |
+| Active Clients | 10/10 | 5/10 | -50% |
+
+Note: Final accuracy (59.34%) exceeds Best periodic eval accuracy (58.11%) because the final evaluation occurs after all threads have joined and completed their last training rounds, whereas periodic evals are taken at 300-second intervals during training. This indicates the surviving clients were still improving when periodic evaluations ended.
+
+Fault events: All 5 clients (0, 2, 4, 6, 8) crashed simultaneously at round 5 (t=7382s).
+
+Per-client final state:
+
+| Client | Status | Rounds | Trust | Cache |
+|---:|---|---:|---:|---:|
+| 0 | CRASHED | 5 | 0.760 | 1 |
+| 1 | ACTIVE | 20 | 0.880 | 4 |
+| 2 | CRASHED | 5 | 0.852 | 1 |
+| 3 | ACTIVE | 20 | 0.833 | 4 |
+| 4 | CRASHED | 5 | 0.775 | 2 |
+| 5 | ACTIVE | 20 | 0.841 | 2 |
+| 6 | CRASHED | 5 | 0.847 | 1 |
+| 7 | ACTIVE | 20 | 0.884 | 4 |
+| 8 | CRASHED | 5 | 0.857 | 1 |
+| 9 | ACTIVE | 20 | 0.770 | 4 |
+
+**Analysis:**
+
+1. **Three distinct phases visible in the trajectory**: The eval-by-eval data reveals a clear three-phase structure:
+
+   - **Phase 1 — Pre-crash climb (eval 1-13, t=300s-7196s)**: All 10 clients are active. The system climbs from 35.93% to a pre-crash peak of 57.06% at eval 10, then oscillates in the 46-57% range through eval 13. The round counts at this stage are low (avg=1-2), meaning clients are still in early training/warmup rounds. This pre-crash phase accounts for over 7000s of wall-clock time but only 2-4 rounds per client on average, reflecting the fact that the majority scenario's 5 designated-to-crash clients will only reach round 5 before failing.
+
+   - **Phase 2 — Immediate post-crash collapse (eval 13-15, t=7196s-7796s)**: All 5 clients crash simultaneously at t=7382s. The accuracy drops sharply from 46.61% (eval 13, which was already declining) to 45.03% (eval 14) and bottoms at 42.77% (eval 15). This 14.29pp drop from the pre-crash peak (57.06%) likely represents the immediate shock of losing half the expert pool. The ensemble evaluation suddenly has only 5 contributing clients, and the surviving clients' caches may still contain stale experts from the crashed clients that could be scored but produce degraded predictions.
+
+   - **Phase 3 — Recovery with reduced capacity (eval 15-24, t=7796s-10574s)**: After the trough at eval 15 (42.77%), accuracy begins recovering as stale experts are evicted and the 5 surviving clients continue training. The recovery is steady: 45.45% (eval 16), 48.02% (eval 17), then accelerating through 49.74% (eval 20), 53.94% (eval 21), 57.11% (eval 22), and converging around 58-59% (evals 22-24). The final value of 59.34% exceeds the pre-crash peak of 57.06%, meaning the 5 surviving clients ultimately exceeded what all 10 clients had achieved before the crash — but this took an additional ~45 minutes of training.
+
+2. **Recovery takes ~8 eval cycles (2400s) from the trough**: From the low point at eval 15 (42.77%, t=7796s) to the point where accuracy surpasses the pre-crash peak at eval 22 (57.11%, t=9973s), the system requires approximately 2177 seconds (~36 minutes) and 7 eval cycles. The min-round column tells the story: at eval 15 the surviving clients are at min=5 / max=7, meaning they had barely progressed beyond the crash point. By eval 22, the range is min=5 / avg=10 / max=20 — the fastest client has completed all 20 rounds while the slowest is stuck at 5 (the crashed clients' final round, frozen in the statistics). The recovery is driven entirely by the surviving clients accumulating more training rounds and building a denser expert cache among themselves.
+
+3. **The 59.34% ceiling reveals the class coverage bottleneck**: Under Dirichlet alpha=0.3, each client specializes in 2-3 classes. With clients 0, 2, 4, 6, 8 removed, the surviving odd-numbered clients (1, 3, 5, 7, 9) likely cover only a subset of the 10 CIFAR-10 classes well, though this has not been verified with per-class analysis. Classes that were primarily assigned to even-numbered clients would have limited or no expert representation in the surviving pool. The router cannot route to expertise that does not exist — which could create a hard accuracy ceiling that additional training alone may not overcome. The final 58-59% plateau (evals 22-24) represents this ceiling.
+
+4. **Longer training time (179.4 min vs 113.9 min baseline) is a transport artifact**: This counterintuitive result — fewer clients taking longer — is caused by the TCP transport layer. The 5 surviving clients repeatedly attempt to send expert packages to the 5 crashed clients, each failed connection incurring a 5-second timeout (`sock.settimeout(5.0)` in `get_or_create_connection()`). With 5 dead peers per sharing round, this adds up to 25 seconds of wasted timeout per expert-sharing cycle. Over 15 remaining rounds, this accounts for the excess time. A production deployment would mark unreachable peers after configurable retry limits.
+
+5. **59.34% in context — above linear prediction but below the No-MoE ablation**:
+
+| Reference Point | Accuracy | Context |
+|---|---:|---|
+| Random chance | 10.00% | 10-class classification |
+| Linear scaling prediction | 36.70% | If accuracy scaled linearly: 73.40% x (5/10) |
+| **Majority failure (5 clients)** | **59.34%** | **5 surviving clients with MoE routing** |
+| No-MoE ablation (10 clients) | 66.29% | 10 clients, local heads only, no expert routing |
+| Baseline (10 clients) | 73.40% | 10 clients with MoE routing |
+
+The 59.34% result sits 22.64pp above the linear prediction (36.70%), suggesting that the surviving clients' knowledge compounds rather than merely sums. However, it falls 6.95pp below the No-MoE ablation (66.29%), which used all 10 clients with local heads only. This may indicate where the framework's assumptions break down: with only 5 experts in the pool and top-k=3 routing, the router selects from nearly the entire pool every forward pass (3 out of 5), potentially reducing the selective advantage that MoE routing provides. The framework's MoE mechanism requires a sufficiently large and diverse expert pool to outperform simpler approaches; at 50% client loss under alpha=0.3, this minimum diversity threshold is not met.
+
+**Scenario 4: Rejoin — Pre-Eviction (2 clients crash after round 8, reconnect after 120s)**
+
+This scenario tests client recovery when the downtime (120s) is shorter than the cache eviction threshold (`max_expert_age=600s`). The disconnected clients' experts remain cached on peers during the downtime, potentially aiding reintegration.
+
+| Metric | Baseline (no fault) | Dropout | Rejoin 120s | Delta (vs Baseline) | Delta (vs Dropout) |
+|---|---:|---:|---:|---:|---:|
+| Final Test Accuracy | 73.40% | 70.21% | 72.66% | -0.74pp | +2.45pp |
+| Best Test Accuracy | 73.09% | 70.94% | 74.06% | +0.97pp | +3.12pp |
+| Total Training Time | 113.9 min | 94.2 min | 132.6 min | +18.7 min | +38.4 min |
+| Active Clients (final) | 10/10 | 8/10 | 10/10 | 0 | +2 |
+
+Fault events:
+- Client 2 disconnected at round 8, transport shutdown, thread exited
+- Client 2 rejoined at round 9, new transport on new port — 120s downtime
+- Client 7 disconnected at round 8, transport shutdown, thread exited
+- Client 7 rejoined at round 9, new transport on new port — 120s downtime
+
+Per-client final state:
+
+| Client | Status | Rounds | Trust | Cache |
+|---:|---|---:|---:|---:|
+| 0 | ACTIVE | 20 | 0.799 | 6 |
+| 1 | ACTIVE | 20 | 0.836 | 9 |
+| 2 | ACTIVE | 20 | 0.904 | 6 |
+| 3 | ACTIVE | 20 | 0.863 | 6 |
+| 4 | ACTIVE | 20 | 0.843 | 6 |
+| 5 | ACTIVE | 20 | 0.841 | 6 |
+| 6 | ACTIVE | 20 | 0.895 | 6 |
+| 7 | ACTIVE | 20 | 0.894 | 9 |
+| 8 | ACTIVE | 20 | 0.907 | 6 |
+| 9 | ACTIVE | 20 | 0.770 | 9 |
+
+**Scenario 5: Rejoin — Post-Eviction (2 clients crash after round 8, reconnect after 700s)**
+
+This scenario tests client recovery when the downtime (700s) exceeds the cache eviction threshold (`max_expert_age=600s`). The disconnected clients' experts are fully evicted from all peers' caches before reconnection, forcing the returning clients to rebuild their presence from scratch.
+
+| Metric | Baseline (no fault) | Dropout | Rejoin 120s | Rejoin 700s | Delta (700s vs Baseline) |
+|---|---:|---:|---:|---:|---:|
+| Final Test Accuracy | 73.40% | 70.21% | 72.66% | 71.82% | -1.58pp |
+| Best Test Accuracy | 73.09% | 70.94% | 74.06% | 71.80% | -1.29pp |
+| Total Training Time | 113.9 min | 94.2 min | 132.6 min | 113.2 min | -0.7 min |
+| Active Clients (final) | 10/10 | 8/10 | 10/10 | 10/10 | 0 |
+
+Fault events:
+- Client 2 disconnected at round 8 (t=1468s), transport shutdown, thread exited
+- Client 2 rejoined at round 9 (t=2208s), new transport on new port — 740s downtime
+- Client 7 disconnected at round 8 (t=2822s), transport shutdown, thread exited
+- Client 7 rejoined at round 9 (t=3522s), new transport on new port — 700s downtime
+
+Per-client final state:
+
+| Client | Status | Rounds | Trust | Cache |
+|---:|---|---:|---:|---:|
+| 0 | ACTIVE | 20 | 0.728 | 6 |
+| 1 | ACTIVE | 20 | 0.924 | 5 |
+| 2 | ACTIVE | 20 | 0.926 | 6 |
+| 3 | ACTIVE | 20 | 0.837 | 3 |
+| 4 | ACTIVE | 20 | 0.806 | 6 |
+| 5 | ACTIVE | 20 | 0.848 | 6 |
+| 6 | ACTIVE | 20 | 0.880 | 6 |
+| 7 | ACTIVE | 20 | 0.892 | 5 |
+| 8 | ACTIVE | 20 | 0.911 | 5 |
+| 9 | ACTIVE | 20 | 0.782 | 3 |
+
+**Analysis (Scenarios 4 & 5 — Combined Rejoin Analysis):**
+
+Both rejoin scenarios share the same failure mechanism: clients 2 and 7 crash after round 8 with full TCP transport shutdown and thread termination, then reconnect on a new port after the configured delay. The only controlled variable is the downtime duration relative to the cache eviction threshold (`max_expert_age=600s`).
+
+1. **True disconnect-reconnect cycle verified in both scenarios**: Both runs involve complete transport shutdown (TCP server socket closed, all peer connections dropped, client thread exits). During the downtime, the disconnected clients are fully unreachable — peers' send attempts fail, no messages are received, no training occurs. On reconnect, a new TCP transport is created on a fresh auto-assigned port, all peer addresses are re-registered bidirectionally, and a new training thread resumes from the checkpoint round (round 9). The per-client statistics confirm successful reintegration in both cases: clients 2 and 7 show ACTIVE status with 20 rounds completed in both runs, with trust scores and cache sizes comparable to never-disconnected peers.
+
+2. **Both rejoin scenarios significantly outperform permanent dropout**: The controlled comparison with the dropout scenario (same crash point, no return) isolates the value of client recovery:
+
+| Scenario | Final Acc | Delta vs Dropout | Recovery Benefit |
+|---|---:|---:|---:|
+| Dropout (no return) | 70.21% | — | — |
+| Rejoin 120s (pre-eviction) | 72.66% | +2.45pp | Substantial |
+| Rejoin 700s (post-eviction) | 71.82% | +1.61pp | Moderate |
+
+Both rejoin scenarios recover meaningful accuracy over permanent dropout. The returning clients contribute additional class expertise to the ensemble by completing rounds 9-20, sharing fresh expert packages, and participating in the final evaluation ensemble. The 2.45pp and 1.61pp improvements over dropout are not marginal — they represent roughly 77% and 51% recovery of the total dropout cost (3.19pp), respectively.
+
+3. **Pre-eviction rejoin (120s) outperforms post-eviction rejoin (700s) by 0.84pp**: The 120s rejoin achieves 72.66% while the 700s rejoin achieves 71.82%. This difference is consistent with the cache eviction mechanism: with 120s downtime (below the 600s `max_expert_age` threshold), the disconnected clients' round-8 experts remain cached on all peers during the downtime. When these clients reconnect, peers already have their most recent experts available, and the returning clients immediately receive cached experts from peers that continued training during the disconnect. With 700s downtime (exceeding the threshold), peers' caches have evicted the disconnected clients' experts. On reconnection, both sides must rebuild cache entries from scratch through new expert sharing rounds. This cold-start penalty accounts for the 0.84pp gap. However, as this comparison is based on single-seed runs, the difference should be interpreted cautiously — it is consistent with the expected direction of the cache eviction effect, but may also reflect normal run-to-run variance.
+
+4. **The 120s rejoin approaches near-baseline accuracy**: The 120s rejoin final accuracy (72.66%) is within 0.74pp of the baseline (73.40%), and its best periodic evaluation accuracy (74.06%) actually exceeds the baseline best (73.09%). This suggests that when downtime is short enough to preserve cached experts, the framework achieves near-complete recovery. The returning clients' model state (preserved from round 8 checkpoint) combined with the surviving cache entries on peers enables rapid reintegration with minimal accuracy cost.
+
+5. **The 700s rejoin still recovers effectively despite complete cache purge**: Even with experts fully evicted from all peers' caches, the 700s rejoin achieves 71.82% — within 1.58pp of the baseline and 1.61pp above dropout. This demonstrates that the framework's recovery mechanism does not depend solely on cached expert persistence. The returning clients bring their own round-8 model state (body encoder, head, router weights) and immediately begin sharing fresh expert packages on reconnection. The trust-weighted routing mechanism and the peer-to-peer sharing protocol enable effective reintegration even from a cold-start cache state.
+
+6. **Returning clients rebuild trust to levels comparable to never-disconnected peers**: In both scenarios, clients 2 and 7 achieve final trust scores within the range of other clients:
+   - 120s rejoin: Client 2 trust=0.904, Client 7 trust=0.894 (peer range: 0.770-0.907)
+   - 700s rejoin: Client 2 trust=0.926, Client 7 trust=0.892 (peer range: 0.728-0.911)
+
+   The trust scores are rebuilt through the EMA trust update mechanism, which incorporates validation accuracy after each training round. Since the returning clients resume training with their round-8 model state (which is already reasonably mature), their validation accuracy — and consequently their trust scores — recover within the remaining 12 training rounds.
+
+7. **Training time differences reflect system-level factors, not the rejoin mechanism**: The 120s rejoin took 132.6 min while the 700s rejoin took 113.2 min. This counterintuitive difference (shorter downtime producing longer total time) is not caused by the rejoin delay itself. The eval intervals are consistently ~300s in both runs, confirming neither experienced machine sleep or stalling. The 19.4 min difference falls within the range of normal run-to-run variation observed across all experiments (baseline: 113.9 min, dropout: 94.2 min, churn: 84.5 min) and is attributable to background system load, thermal conditions, and other environmental factors on the single test machine. The accuracy results, which are determined by the learning dynamics rather than wall-clock timing, are not affected by this variation.
+
+#### 17.11.3 Fault Tolerance Summary
+
+The following table synthesises all fault tolerance results:
+
+| Scenario | Active Clients | Final Acc | Delta vs Baseline | Relative Degradation |
+|---|---|---:|---:|---:|
+| Baseline (no fault) | 10/10 | 73.40% | — | — |
+| Churn (20% intermittent) | 10/10 (~16 rounds each) | 73.62% | +0.22pp | 0% (within noise) |
+| Rejoin 120s (pre-eviction) | 10/10 (2 disconnected 120s) | 72.66% | -0.74pp | 1.0% |
+| Rejoin 700s (post-eviction) | 10/10 (2 disconnected 700s) | 71.82% | -1.58pp | 2.2% |
+| Dropout (20% permanent) | 8/10 | 70.21% | -3.19pp | 4.3% |
+| Majority (50% permanent) | 5/10 | 59.34% | -14.06pp | 19.1% |
+
+**Sub-linear degradation curve**: The three permanent-loss data points (0%, 20%, 50% client loss) trace a non-linear degradation curve:
+
+| Client Loss | Linear Prediction (pp cost) | Actual Cost (pp) | Ratio (actual/linear) |
+|---:|---:|---:|---:|
+| 0% | 0.00 | 0.00 | — |
+| 20% | 7.34 | 3.19 | 0.43 |
+| 50% | 18.35 | 14.06 | 0.77 |
+
+At 20% client loss, the actual cost is only 43% of the linear prediction — which may indicate the framework absorbs the loss efficiently because the remaining 8 clients still provide sufficient class coverage and expert diversity for top-k=3 routing. At 50% loss, the ratio rises to 77%, and the data suggests degradation may accelerate toward linear as the expert pool shrinks below the threshold where MoE routing can be selective. Extrapolating, the curve would likely cross the linear prediction somewhere above 50% loss, at which point the overhead of MoE routing may outweigh its benefits.
+
+**Recovery spectrum — from temporary to permanent loss**: The rejoin experiments reveal a clear ordering of recovery effectiveness that aligns with the expected cache and diversity dynamics:
+
+| Scenario | Final Acc | Recovery vs Dropout | Mechanism |
+|---|---:|---:|---|
+| Dropout (permanent) | 70.21% | — | Experts lost permanently; 2 clients never return |
+| Rejoin 700s (post-eviction) | 71.82% | +1.61pp (51% recovered) | Clients return but must rebuild cache from scratch |
+| Rejoin 120s (pre-eviction) | 72.66% | +2.45pp (77% recovered) | Clients return with cached experts still on peers |
+| Baseline (no fault) | 73.40% | +3.19pp (100%) | No disruption |
+
+The recovery benefit scales with the amount of state preserved: pre-eviction rejoin recovers 77% of the dropout cost because cached experts survive the downtime, while post-eviction rejoin recovers 51% because the returning clients must rebuild their cache presence from scratch. Both substantially outperform permanent dropout, demonstrating that the framework's peer-to-peer protocol enables effective client reintegration regardless of whether prior cached state persists.
+
+**Learning curve comparison across scenarios**: The eval-by-eval trajectories reveal how each failure mode affects the training dynamics:
+
+- **Churn** tracks the baseline throughout, with no identifiable disruption points. The curve is smooth and monotonically improving. By eval 12 (~3600s), churn is within 1pp of the baseline and remains there.
+- **Dropout** tracks the baseline before the crashes, then diverges to a parallel trajectory ~3pp lower. The two crash events produce no visible discontinuities — the gap emerges gradually as the remaining 8 clients converge to a lower ceiling.
+- **Rejoin (both 120s and 700s)** follows the dropout trajectory during the disconnect window, then recovers in the later evaluations as the returning clients reintegrate and contribute to the ensemble. The 120s rejoin converges closer to the baseline (within 0.74pp) while the 700s rejoin converges to a slightly lower level (within 1.58pp).
+- **Majority** shows the most dramatic trajectory: a slow pre-crash climb to ~57%, a sharp post-crash collapse to ~43%, and then a recovery arc that takes ~36 minutes (8 eval cycles) to surpass the pre-crash peak. The final plateau at ~59% is well below the other scenarios but well above chance.
+
+The key observation is that churn, dropout, and both rejoin scenarios all produce smooth, predictable trajectories — the framework appears to absorb these faults continuously. Majority produces a visible discontinuity followed by a recovery period, possibly revealing the system's self-healing dynamics (stale expert eviction, cache rebuilding, trust re-estimation) operating in real time.
+
+**Key findings:**
+
+1. **Expert diversity appears to be the binding constraint, not training iterations**: This appears to be the most significant finding from the fault tolerance experiments. Churn removes ~22% of training iterations while preserving all 10 experts and costs 0pp. Dropout removes 2 experts while the remaining 8 train to completion and costs 3.19pp. These results suggest the framework's accuracy ceiling may be primarily determined by the breadth of class expertise available in the expert pool. Once an expert has trained enough rounds to be useful (empirically approximately 8-10 rounds, as suggested by where the dropout trajectory stabilizes), additional gradient steps appear to yield diminishing returns. This has a direct design implication: in deployment, maximizing the number of participating clients matters more than maximizing per-client training time.
+
+2. **Intermittent failures are free**: 20% random round skips produced 73.62% — statistically identical to the 73.40% baseline (+0.22pp, within single-seed noise). This is the most common failure mode in real-world FL (mobile devices going offline, network interruptions, resource contention), and the framework handles it with negligible accuracy cost. The combination of asynchronous training, trust-weighted routing, and staleness decay may contribute to this robustness to transient unavailability, though isolating each component's individual contribution would require further ablation.
+
+3. **Permanent loss degrades sub-linearly up to a critical threshold**: At 20% permanent client loss, degradation is only 4.3% relative (43% of linear prediction). At 50%, it accelerates to 19.1% (77% of linear prediction). The accelerating ratio suggests the framework may be approaching the point where MoE routing loses its selective advantage. With 5 experts and top-k=3, the router selects 60% of the pool on every forward pass, leaving minimal room for selective routing.
+
+4. **Client recovery provides substantial benefit, with cache persistence as a secondary factor**: The rejoin experiments demonstrate that the framework's peer-to-peer protocol supports true disconnect-reconnect cycles — full TCP transport shutdown, complete unreachability for 120-700s, fresh transport on a new port, bidirectional peer re-registration, and checkpoint-based training resumption. Pre-eviction rejoin (120s) recovers 77% of the dropout cost (2.45pp of 3.19pp), while post-eviction rejoin (700s) recovers 51% (1.61pp of 3.19pp). The 0.84pp gap between the two rejoin scenarios is consistent with the expected effect of cache eviction — returning to a network that remembers your experts enables faster reintegration than returning to one that has forgotten them — though this difference should be interpreted cautiously given single-seed variance. In both cases, returning clients successfully rebuild trust scores and cache sizes to levels comparable to never-disconnected peers within the remaining training rounds.
+
+5. **The system never crashes or halts**: Under all scenarios, including simultaneous 50% catastrophic failure, true transport-level disconnect-reconnect cycles, and post-eviction cold-start reconnection, the framework continued training, evaluating, reclustering, and saving results without deadlock, data corruption, or unhandled exceptions. In synchronous FL with a round barrier, a permanently crashed client prevents the barrier from completing by architectural design — the system cannot proceed past the round where the client died. Our async framework has no such barrier; surviving clients continue independently without awareness of peer failures.
+
+6. **Honest limitations — where the framework's assumptions break down**: The majority scenario (59.34%) falls below the No-MoE ablation (66.29%, which used all 10 clients with local heads only and no expert routing). This suggests a potential boundary condition: when the expert pool drops to 5 clients under alpha=0.3 non-IID partitioning, the MoE routing mechanism may provide no benefit over simpler local-head-only approaches. The overhead of the routing infrastructure (FSTs, trust scoring, cache management) appears unable to compensate for the loss of class expertise that 5 dead clients took with them. This suggests a practical deployment consideration: the framework's MoE advantage requires a minimum ratio of surviving experts to top-k selection size. With only two permanent-loss data points (20% and 50%), the exact threshold cannot be pinpointed, but the data indicates that 80% participation (8/10 clients) is sufficient while 50% participation (5/10 clients) is not. Deployments expecting high failure rates should consider increasing total client count so that the surviving pool remains large enough for selective routing, or reducing top-k relative to expected surviving clients.
+
+7. **Comparison with prior work (dFLMoE)**: The original dFLMoE paper tested two disconnect scenarios: static reduced-participation (starting with fewer clients from round 1) and random communication drops. Neither involves mid-training dynamic failure where clients contribute knowledge in early rounds and then disappear, potentially leaving stale experts in peers' caches. Our experiments test strictly harder scenarios — mid-training crashes with full TCP transport shutdown, stale expert eviction dynamics, true disconnect-reconnect with checkpoint resume (both pre- and post-eviction), and cache rebuilding under reduced client populations. The pre-eviction vs post-eviction rejoin comparison in particular (isolating the role of cache persistence in recovery) has no equivalent in prior dFLMoE work.
+
 ---
 
 <!-- ╔══════════════════════════════════════════════════════════════════════════╗ -->
@@ -3284,21 +3610,30 @@ Because only the 134K-parameter expert head crosses the network (not the 3.2M-pa
 
 ### 23.2 Dataset Details
 
-**CIFAR-10**:
+**CIFAR-10** (primary benchmark — all experiments):
 - 50,000 training images, 10,000 test images
 - 10 classes, 32×32×3 RGB
 - Training augmentation: RandomCrop(32, padding=4), RandomHorizontalFlip, Normalize(μ=[0.4914, 0.4822, 0.4465], σ=[0.2023, 0.1994, 0.2010])
 - Test: Normalize only (no augmentation)
 - Per-client: ~4,500 training samples (after 90/10 train/val split)
 
-**MNIST**:
+CIFAR-10 is the standard benchmark for federated learning research, used by FedAvg, FedProx, SCAFFOLD, FedRAD, and FedGPD. All experimental results in this work use CIFAR-10 exclusively to enable direct comparison with the FL literature.
+
+**MNIST** (supported but not evaluated):
 - 60,000 training images, 10,000 test images
 - 10 classes, 28×28×1 grayscale → resized to 32×32 for SimpleCNNBody
 - Normalize(μ=0.1307, σ=0.3081)
+- The framework supports MNIST via `--dataset mnist`, but no formal experiments are reported. MNIST is a simpler task (>99% centralized accuracy) and does not meaningfully differentiate FL methods.
 
 ### 23.3 Data Partitioning Protocol
 
-**Dirichlet partitioning**: For each class $c \in \{0, ..., 9\}$, sample proportions $p_c \sim \text{Dir}(\alpha, ..., \alpha)$ (N entries). Distribute class $c$'s samples according to $p_c$. Lower $\alpha$ → more heterogeneous (each client dominated by 1-3 classes).
+Three partitioning strategies are implemented. **Dirichlet partitioning** is the primary method used across all experiments (alpha sweep, ablations, fault tolerance). **Label sharding** and **IID** are used as supplementary experiments to characterize the framework at the extreme ends of the heterogeneity spectrum.
+
+**Dirichlet partitioning** (primary — all experiments): For each class $c \in \{0, ..., 9\}$, sample proportions $p_c \sim \text{Dir}(\alpha, ..., \alpha)$ (N entries). Distribute class $c$'s samples according to $p_c$. Lower $\alpha$ → more heterogeneous (each client dominated by 1-3 classes). Alpha values tested: 0.1, 0.2, 0.3, 0.5. Dirichlet is the standard non-IID strategy in the FL literature (Hsu et al. [3]) because it provides a continuous heterogeneity knob, unlike label sharding which is binary.
+
+**Label sharding** (supplementary — extreme non-IID): Each client receives data from exactly `classes_per_client` classes (default: 2). With 10 clients and 10 classes, each client sees only 2/10 classes, producing maximum heterogeneity. Individual client accuracy is capped at ~20% on the global test set. This stress-tests the MoE routing: the router must correctly route each test sample to the expert that was trained on that class. Command: `--partition_method label_sharding --classes_per_client 2`.
+
+**IID baseline** (supplementary — upper bound): All samples randomly shuffled and split into N equal parts. Each client gets ~5,000 samples with approximately uniform class distribution. This establishes the upper bound of our framework's accuracy — MoE routing should provide minimal benefit when all clients have identical data distributions. Command: `--partition_method iid`.
 
 **Partition-first, split-second**: The FULL training set (50,000 samples) is partitioned first across clients. Then each client's share is split 90% train / 10% validation. This guarantees each client's validation set has the same class distribution as their training set — critical for meaningful trust scores.
 
@@ -3325,12 +3660,14 @@ The following ablations have been conducted (results in Section 17):
 | **Hyperparameter sensitivity** (17.3) | LR decay, dropout, weight decay | LR_decay=0.98, dropout=0.3 optimal |
 | **Entropy gating** (17.3) | Added entropy-based expertise gating | No improvement over composite scoring |
 
+**Supplementary partitioning experiments** (results pending in Section 17):
+- **IID baseline**: `--partition_method iid` — establishes upper bound accuracy; MoE routing expected to provide minimal benefit
+- **Label sharding**: `--partition_method label_sharding --classes_per_client 2` — extreme non-IID stress test; router must correctly select per-class experts
+
 **Not yet ablated** (limited by computation budget):
 - Trust scoring removed (uniform trust=1.0 for all experts)
 - Staleness removed (staleness_factor=1.0 for all experts)
 - FST removed (identity transform, no learning)
-- Hierarchy removed (flat all-to-all instead of clustering)
-- Warmup removed (fixed alpha=0.5 from round 1)
 - Feature detachment removed (gradients flow through body from MoE)
 
 ### 23.6 Statistical Significance

@@ -104,7 +104,8 @@ class ClientNode:
         self.cross_cluster_exchange_seconds = cross_cluster_interval    # Cross-cluster: wall-clock time based (consistent with async design)
         self._last_cross_cluster_time = time.time()                      # Timestamp of last cross-cluster exchange (init to now so round-1 doesn't fire cross-cluster before any training)
         self.current_round = 0
-        
+        self.is_active = True  # False when client has crashed/disconnected (fault tolerance)
+
         # Track which FST keys have been added to optimizer_router
         # (FSTs created after optimizer init must be explicitly added)
         self._registered_fst_keys = set()
@@ -705,6 +706,32 @@ class ClientNode:
         }
 
         return stats
+
+    def reconnect_transport(self, peer_addresses: Dict[str, tuple]):
+        """Restart transport after a disconnect (true rejoin).
+
+        Creates a brand-new TCPTransport on a fresh auto-assigned port,
+        re-registers the expert_package handler, and re-registers all
+        known peer addresses. The caller is responsible for updating
+        OTHER clients' peer registries to point to the new port.
+
+        Args:
+            peer_addresses: Dict of {peer_client_id: (host, port)} for
+                all peers this client should be able to reach.
+
+        Returns:
+            The new (host, port) so the caller can update peers.
+        """
+        self.transport = TCPTransport(
+            client_id=self.client_id, host='127.0.0.1', port=0
+        )
+        self.transport.register_handler('expert_package', self._handle_expert_package)
+
+        # Re-register all peer addresses on the new transport
+        for peer_id, (host, port) in peer_addresses.items():
+            self.transport.register_peer(peer_id, host, port)
+
+        return self.transport.get_address()
 
     def shutdown(self):
         self.transport.shutdown()

@@ -18,6 +18,7 @@ import time
 import threading
 import queue
 import argparse
+import random
 from pathlib import Path
 from typing import List, Dict
 import numpy as np
@@ -84,6 +85,17 @@ def parse_args():
     parser.add_argument('--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--sync', action='store_true',
                         help='Use synchronous training (round barrier) instead of async')
+
+    # Fault tolerance testing
+    parser.add_argument('--fault_scenario', type=str, default=None,
+                        choices=['dropout', 'rejoin', 'churn', 'majority'],
+                        help='Fault tolerance test: dropout=crash 2 clients after R8, '
+                             'rejoin=disconnect+reconnect, '
+                             'churn=20%% random round skips, '
+                             'majority=50%% crash after R5')
+    parser.add_argument('--rejoin_delay', type=float, default=120.0,
+                        help='Seconds of downtime before rejoin (rejoin scenario only). '
+                             'Set > max_expert_age to test post-eviction rejoin')
 
     return parser.parse_args()
 
@@ -472,6 +484,12 @@ def run_federated_learning(args):
         print(f"Dirichlet alpha: {args.non_iid_alpha}")
     elif args.partition_method == 'label_sharding':
         print(f"Classes per client: {args.classes_per_client}")
+    if args.fault_scenario:
+        if args.sync:
+            raise ValueError("--fault_scenario is only supported in async mode (remove --sync)")
+        print(f"Fault scenario: {args.fault_scenario}")
+        if args.fault_scenario == 'rejoin':
+            print(f"Rejoin delay: {args.rejoin_delay}s")
     print()
 
     # Load dataset
@@ -615,11 +633,13 @@ def run_federated_learning(args):
 
     training_start_time = time.time()
 
-    def client_training_loop(idx, client, train_loader, val_loader):
-        """Independent training loop for a single client.
+    def client_training_loop(idx, client, train_loader, val_loader,
+                             fault_scenario=None, fault_rng=None,
+                             start_round=1):
+        """Independent training loop for a single client with optional fault injection.
 
-        This function runs in its own thread. The client trains for
-        args.rounds local rounds at its own pace, with no synchronization
+        This function runs in its own thread. The client trains from
+        start_round to args.rounds at its own pace, with no synchronization
         barrier with other clients. Expert packages arrive asynchronously
         via the transport layer during training.
 
@@ -629,11 +649,65 @@ def run_federated_learning(args):
         until all clients have finished training. Without keep-alive,
         fast-finishing clients' experts get evicted, degrading the expert
         pool for still-training clients.
-        """
-        for local_round in range(1, args.rounds + 1):
-            # eval_pause is checked at each epoch boundary inside
-            # _train_epoch_corrected(), so clients pause quickly
 
+        Fault scenarios (when fault_scenario is set):
+        - dropout: Clients 2,7 crash after round 8 (transport shutdown)
+        - rejoin: Clients 2,7 crash after round 8, thread exits completely;
+          monitoring loop spawns a new thread after 120s with checkpoint resume
+        - churn: Each client has 20% chance of skipping any round
+        - majority: Clients 0,2,4,6,8 crash after round 5
+
+        Args:
+            start_round: Round to start from (default 1, or higher for checkpoint resume)
+        """
+        client_crashed = False  # Track if this client has been "crashed"
+
+        for local_round in range(start_round, args.rounds + 1):
+            # === FAULT INJECTION ===
+            if fault_scenario == 'dropout':
+                # Clients 2,7 crash after round 8 — stop training, shutdown transport
+                if idx in (2, 7) and local_round > 8:
+                    if local_round == 9:  # Log once on first skipped round
+                        print(f"  [FAULT] Client {idx} CRASHED at round 8 (dropout scenario)")
+                        stats_queue.put(('fault', idx, 8, 'dropout'))
+                        client.is_active = False
+                        client.transport.shutdown()
+                        client_crashed = True
+                    continue  # Skip all remaining rounds
+
+            elif fault_scenario == 'rejoin':
+                # Clients 2,7 crash after round 8 — transport shutdown, thread EXITS.
+                # The monitoring loop handles the 120s delay and spawns a new thread.
+                if idx in (2, 7) and local_round == 9 and start_round == 1:
+                    print(f"  [FAULT] Client {idx} CRASHED at round 8 "
+                          f"(transport shutdown, thread exiting)")
+                    stats_queue.put(('fault', idx, 8, 'disconnected'))
+                    client.is_active = False
+                    client.transport.shutdown()
+                    # Schedule rejoin: monitoring loop will spawn new thread after delay
+                    stats_queue.put(('rejoin_pending', idx, 9, None))
+                    return  # Thread exits completely — no keep-alive, no 'done'
+
+            elif fault_scenario == 'churn':
+                # 20% chance of skipping any round (per-client seeded RNG)
+                if fault_rng.random() < 0.20:
+                    print(f"  [FAULT] Client {idx} SKIPPED round {local_round} (churn)")
+                    stats_queue.put(('fault', idx, local_round, 'skipped'))
+                    time.sleep(30)  # Sleep ~1 round duration
+                    continue  # Skip this round
+
+            elif fault_scenario == 'majority':
+                # Clients 0,2,4,6,8 crash after round 5
+                if idx in (0, 2, 4, 6, 8) and local_round > 5:
+                    if local_round == 6:  # Log once on first skipped round
+                        print(f"  [FAULT] Client {idx} CRASHED at round 5 (majority failure)")
+                        stats_queue.put(('fault', idx, 5, 'majority_dropout'))
+                        client.is_active = False
+                        client.transport.shutdown()
+                        client_crashed = True
+                    continue  # Skip all remaining rounds
+
+            # === NORMAL TRAINING ===
             try:
                 metrics = client.train_round(
                     train_loader=train_loader,
@@ -647,6 +721,10 @@ def run_federated_learning(args):
                 stats_queue.put(('error', idx, local_round, str(e)))
 
         stats_queue.put(('done', idx, 0, None))
+
+        # Skip keep-alive for crashed clients (transport already shutdown)
+        if client_crashed:
+            return
 
         # Keep-alive: re-share final expert every 30s to prevent intra-cluster eviction.
         # The expert timestamp is refreshed on each intra-cluster share, so cluster
@@ -669,12 +747,62 @@ def run_federated_learning(args):
             except Exception as e:
                 print(f"  [Client {idx}] Keep-alive share error: {e}")
 
+    def rejoin_after_delay(idx, client, train_loader, val_loader,
+                           resume_round, delay_seconds, fault_rng):
+        """Simulate true client rejoin: wait for downtime, then reconnect and resume.
+
+        Runs in its own thread. Waits for the full downtime period (client
+        is completely unreachable), then:
+        1. Reconnects transport on a new port
+        2. Updates all peers with the new address
+        3. Spawns the training loop from the checkpoint round
+
+        The client's model/optimizer state stays in memory (simulating a
+        checkpoint loaded from disk — the bytes are identical either way).
+        """
+        time.sleep(delay_seconds)
+
+        # Reconnect: new transport on fresh port, re-register all peers
+        peer_addresses = {}
+        for j, other_client in enumerate(clients):
+            if j != idx and other_client.is_active:
+                _, other_port = other_client.transport.get_address()
+                peer_addresses[other_client.client_id] = ('127.0.0.1', other_port)
+
+        new_host, new_port = client.reconnect_transport(peer_addresses)
+
+        # Update all other clients' peer registries to point to new port
+        for j, other_client in enumerate(clients):
+            if j != idx and other_client.is_active:
+                other_client.transport.register_peer(
+                    client.client_id, '127.0.0.1', new_port
+                )
+
+        client.is_active = True
+        client.eval_pause = eval_pause
+
+        print(f"  [FAULT] Client {idx} REJOINED on new port {new_port} "
+              f"after {delay_seconds}s full disconnect — resuming from round {resume_round}")
+        stats_queue.put(('fault', idx, resume_round, 'rejoined'))
+
+        # Resume training from checkpoint round in this new thread
+        client_training_loop(idx, client, train_loader, val_loader,
+                             fault_scenario='rejoin', fault_rng=fault_rng,
+                             start_round=resume_round)
+
+    # Create per-client RNGs for reproducible fault injection (churn scenario)
+    fault_rngs = [random.Random(args.seed + i) for i in range(args.num_clients)]
+
+    if args.fault_scenario:
+        print(f"[FAULT TOLERANCE] Scenario: {args.fault_scenario}")
+
     # Launch all client threads independently
     threads = []
     for i, client in enumerate(clients):
         t = threading.Thread(
             target=client_training_loop,
-            args=(i, client, train_loaders[i], val_loaders[i]),
+            args=(i, client, train_loaders[i], val_loaders[i],
+                  args.fault_scenario, fault_rngs[i]),
             daemon=True,
             name=f"Client-{i}"
         )
@@ -690,6 +818,7 @@ def run_federated_learning(args):
     last_eval_time = training_start_time
     last_recluster_time = training_start_time
     eval_count = 0
+    fault_events = []  # Track fault injection events for results
 
     # First recluster after initial features are computed (~30s)
     first_recluster_done = False
@@ -711,6 +840,31 @@ def run_federated_learning(args):
                           f"Val Acc={data['val_acc']:.3f}, "
                           f"Cache={data['cache_size']}, "
                           f"Experts={data['experts_used']}")
+            elif msg_type == 'fault':
+                elapsed_at_fault = time.time() - training_start_time
+                fault_events.append({
+                    'client_id': idx,
+                    'round': rnd,
+                    'event': data,
+                    'time': elapsed_at_fault
+                })
+                print(f"  [FAULT EVENT] Client {idx} round {rnd}: {data} "
+                      f"(t={elapsed_at_fault:.0f}s)")
+            elif msg_type == 'rejoin_pending':
+                # Client thread exited (crashed). Spawn rejoin thread that
+                # waits for rejoin_delay (true downtime) then reconnects.
+                delay = args.rejoin_delay
+                print(f"  [FAULT] Client {idx} thread exited. "
+                      f"Rejoin scheduled in {delay:.0f}s from round {rnd}")
+                rejoin_t = threading.Thread(
+                    target=rejoin_after_delay,
+                    args=(idx, clients[idx], train_loaders[idx], val_loaders[idx],
+                          rnd, delay, fault_rngs[idx]),
+                    daemon=True,
+                    name=f"Rejoin-Client-{idx}"
+                )
+                threads.append(rejoin_t)
+                rejoin_t.start()
             elif msg_type == 'error':
                 print(f"  [Client {idx}] Round {rnd} ERROR: {data}")
             elif msg_type == 'done':
@@ -759,7 +913,7 @@ def run_federated_learning(args):
                 # with time — trust, similarity, and learned gating are sufficient.
                 # This is analogous to disabling dropout during evaluation.
                 for i, client in enumerate(clients):
-                    if client.body_encoder is not None:
+                    if client.is_active and client.body_encoder is not None:
                         client.body_encoder.eval()
                         client.head.eval()
                         client.router.eval()
@@ -813,7 +967,7 @@ def run_federated_learning(args):
             finally:
                 # ALWAYS restore train mode, staleness lambda, and resume clients
                 for i, client in enumerate(clients):
-                    if client.body_encoder is not None:
+                    if client.is_active and client.body_encoder is not None:
                         client.body_encoder.train()
                         client.head.train()
                         client.router.train()
@@ -838,8 +992,9 @@ def run_federated_learning(args):
     print("="*70 + "\n")
 
     # Set eval mode and disable staleness (same rationale as periodic evals)
+    # Skip inactive (crashed) clients — their transport/model may be in bad state
     for client in clients:
-        if client.body_encoder is not None:
+        if client.is_active and client.body_encoder is not None:
             client.body_encoder.eval()
             client.head.eval()
             client.router.eval()
@@ -850,6 +1005,8 @@ def run_federated_learning(args):
 
     global_stats['final_test_acc'] = final_test_acc
     global_stats['total_training_time'] = total_training_time
+    global_stats['fault_scenario'] = args.fault_scenario
+    global_stats['fault_events'] = fault_events
 
     print(f"Final Global Test Accuracy: {final_test_acc:.4f}")
     if len(global_stats['test_acc']) > 0:
@@ -872,11 +1029,13 @@ def run_federated_learning(args):
             'experts_used': stats['experts_used'],
             'trust_score': client.trust_score,
             'validation_accuracy': client.validation_accuracy,
-            'cache_size': stats['cache']['size']
+            'cache_size': stats['cache']['size'],
+            'is_active': client.is_active
         }
         client_final_stats.append(client_info)
 
-        print(f"\nClient {i}:")
+        status_str = "ACTIVE" if client.is_active else "CRASHED"
+        print(f"\nClient {i} [{status_str}]:")
         print(f"  Rounds: {stats['rounds_completed']}")
         print(f"  Experts Sent: {stats['experts_sent']}")
         print(f"  Experts Received: {stats['experts_received']}")
@@ -931,10 +1090,14 @@ def evaluate_global(
     total = 0
 
     # Prepare all clients: build expert heads from cache
+    # Inactive (crashed) clients are skipped during the per-sample ensemble below
     client_expert_heads = []
     for client in clients:
         # Build expert heads from this client's cache (once, not per batch)
         expert_heads = {}
+        if not client.is_active:
+            client_expert_heads.append(expert_heads)
+            continue
         if client.cache.size() > 0:
             expert_packages = client.cache.get_available_experts(exclude_id=client.client_id)
             for pkg in expert_packages:
@@ -962,6 +1125,8 @@ def evaluate_global(
             total_weight = torch.zeros(x.size(0), 1, device=device)
 
             for i, client in enumerate(clients):
+                if not client.is_active:
+                    continue
                 if client.body_encoder is None or client.head is None:
                     continue
 
@@ -1008,7 +1173,8 @@ def save_results(args, global_stats):
     results_dir.mkdir(exist_ok=True)
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    results_file = results_dir / f"results_{args.dataset}_{args.partition_method}_{timestamp}.txt"
+    fault_suffix = f"_fault-{args.fault_scenario}" if args.fault_scenario else ""
+    results_file = results_dir / f"results_{args.dataset}_{args.partition_method}{fault_suffix}_{timestamp}.txt"
 
     with open(results_file, 'w') as f:
         f.write("=" * 70 + "\n")
@@ -1048,7 +1214,11 @@ def save_results(args, global_stats):
         f.write(f"  Mode:               {'Synchronous' if args.sync else 'Asynchronous'}\n")
         f.write(f"  Feature Dim:        {args.feature_dim}\n")
         f.write(f"  Seed:               {args.seed}\n")
-        f.write(f"  Device:             {args.device}\n\n")
+        f.write(f"  Device:             {args.device}\n")
+        f.write(f"  Fault Scenario:     {args.fault_scenario or 'None'}\n")
+        if args.fault_scenario == 'rejoin':
+            f.write(f"  Rejoin Delay:       {args.rejoin_delay}s\n")
+        f.write("\n")
 
         # Per-evaluation metrics table
         f.write("PER-EVALUATION METRICS (time-based)\n")
@@ -1078,6 +1248,22 @@ def save_results(args, global_stats):
 
         f.write("\n")
 
+        # Fault tolerance events (if any)
+        fault_events = global_stats.get('fault_events', [])
+        fault_scenario = global_stats.get('fault_scenario', None)
+        if fault_scenario:
+            f.write(f"FAULT TOLERANCE TEST: {fault_scenario.upper()}\n")
+            f.write("-" * 70 + "\n")
+            if len(fault_events) > 0:
+                f.write(f"  {'Time(s)':>8} | {'Client':>7} | {'Round':>6} | {'Event'}\n")
+                f.write(f"  {'-'*8} | {'-'*7} | {'-'*6} | {'-'*30}\n")
+                for fe in fault_events:
+                    f.write(f"  {fe['time']:>8.1f} | {fe['client_id']:>7} | "
+                            f"{fe['round']:>6} | {fe['event']}\n")
+            else:
+                f.write("  No fault events recorded.\n")
+            f.write("\n")
+
         # Final test accuracy
         f.write("FINAL RESULTS\n")
         f.write("-" * 70 + "\n")
@@ -1106,14 +1292,15 @@ def save_results(args, global_stats):
         client_stats = global_stats.get('client_final_stats', [])
         if len(client_stats) > 0:
             f.write("PER-CLIENT FINAL STATISTICS\n")
-            f.write("-" * 85 + "\n")
-            f.write(f"{'Client':>7} | {'Trust':>6} | {'Val Acc':>7} | "
+            f.write("-" * 100 + "\n")
+            f.write(f"{'Client':>7} | {'Status':>8} | {'Trust':>6} | {'Val Acc':>7} | "
                     f"{'Rounds':>6} | {'Sent':>5} | {'Recv':>5} | {'Relay':>5} | {'Registered':>10} | "
                     f"{'Used':>5} | {'Cache':>5}\n")
-            f.write("-" * 85 + "\n")
+            f.write("-" * 100 + "\n")
 
             for cs in client_stats:
-                f.write(f"{cs['client_id']:>7} | {cs['trust_score']:>6.3f} | "
+                status_str = "ACTIVE" if cs.get('is_active', True) else "CRASHED"
+                f.write(f"{cs['client_id']:>7} | {status_str:>8} | {cs['trust_score']:>6.3f} | "
                         f"{cs['validation_accuracy']:>7.3f} | "
                         f"{cs['rounds_completed']:>6} | "
                         f"{cs['experts_sent']:>5} | {cs['experts_received']:>5} | "
