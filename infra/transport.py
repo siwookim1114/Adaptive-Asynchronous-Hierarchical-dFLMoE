@@ -12,8 +12,6 @@ Features:
 - Message framing (handles partial sends/receives)
 - Automatic reconnection
 - Real network statistics
-
-For future scalability when in production -> Might consider changing to gRPC protocols 
 """
 import socket
 import pickle

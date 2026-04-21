@@ -72,7 +72,7 @@ def test_basic_clustering():
     print(f"  Cluster peers: {targets['cluster_peers']}")
     print(f"  Cluster heads: {targets['cluster_heads']}")
     
-    print("\n✅ Test 1 Complete!\n")
+    print("\nTest 1 Complete!\n")
     return cluster_manager
 
 
@@ -118,7 +118,7 @@ def test_hierarchical_communication(cluster_manager):
     reduction = (1 - (total_within + total_across) / no_clustering) * 100
     print(f"Reduction: {reduction:.1f}%")
     
-    print("\n✅ Test 2 Complete!\n")
+    print("\nTest 2 Complete!\n")
 
 
 def test_dynamic_updates(cluster_manager):
@@ -147,7 +147,7 @@ def test_dynamic_updates(cluster_manager):
     print(f"  New cluster: {new_cluster}")
     
     if new_cluster != old_cluster:
-        print("  ✅ Client moved to different cluster!")
+        print("Client moved to different cluster!")
     
     # Update trust score
     print("\nUpdating client_11 trust score...")
@@ -164,9 +164,9 @@ def test_dynamic_updates(cluster_manager):
     print(f"  Is cluster head now: {new_is_head}")
     
     if old_is_head and not new_is_head:
-        print("  ✅ Cluster head changed due to low trust!")
+        print("Cluster head changed due to low trust!")
     
-    print("\n✅ Test 3 Complete!\n")
+    print("\nTest 3 Complete!\n")
 
 
 def test_client_removal(cluster_manager):
@@ -186,12 +186,12 @@ def test_client_removal(cluster_manager):
     print(f"  Cluster after removal: {new_cluster}")
     
     if new_cluster is None:
-        print("  ✅ Client successfully removed!")
+        print("Client successfully removed!")
     
     # Print updated statistics
     cluster_manager.print_statistics()
     
-    print("✅ Test 4 Complete!\n")
+    print("Test 4 Complete!\n")
 
 
 def test_integration_example():
@@ -260,7 +260,7 @@ def test_integration_example():
     print("\nFinal Statistics:")
     cluster_manager.print_statistics()
     
-    print("✅ Test 5 Complete!\n")
+    print("Test 5 Complete!\n")
 
 
 if __name__ == "__main__":
@@ -289,10 +289,10 @@ if __name__ == "__main__":
         test_integration_example()
         
         print("="*70)
-        print("ALL TESTS COMPLETE! ✅")
+        print("ALL TESTS COMPLETE!")
         print("="*70)
         
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         import traceback
         traceback.print_exc()

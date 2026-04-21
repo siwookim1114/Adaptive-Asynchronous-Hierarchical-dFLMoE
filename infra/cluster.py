@@ -1,7 +1,7 @@
 """
 Cluster Manager for Hierarchical Organization
 
-This module organizes federated clients into hierarchical clusters to reduce communication overhead from O(N^2) -> O(NlogN)
+This module organizes federated clients into hierarchical clusters to reduce communication overhead from O(N^2) -> O(NsqrtN)
 
 Features:
 - Similarity-based clustering (using representative features)
@@ -12,7 +12,7 @@ Features:
 """
 import numpy as np
 import torch
-import threading
+import threading 
 import time
 from typing import Dict, List, Set, Tuple, Optional
 from collections import defaultdict

@@ -422,7 +422,7 @@ def create_client_dataloaders(config) -> Tuple[List[DataLoader], List[DataLoader
         shuffle=False
     )
     
-    print("✅ DataLoaders created successfully!\n")
+    print("DataLoaders created successfully!\n")
     
     return train_loaders, val_loaders, test_loader
 
@@ -465,7 +465,7 @@ def verify_partitioning(partitioner: DataPartitioner):
     assert all_indices.min() >= 0, "Invalid negative index!"
     assert all_indices.max() < len(partitioner.dataset), "Index out of bounds!"
     
-    print(f"\n✅ Verification passed!")
+    print(f"\n Verification passed!")
     print(f"   • All {len(partitioner.dataset)} samples assigned")
     print(f"   • No duplicates")
     print(f"   • All indices valid")

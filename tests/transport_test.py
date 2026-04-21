@@ -99,9 +99,9 @@ def example_two_clients_same_machine():
     print(f"Client B received {len(received_b)} messages")
     
     if len(received_a) > 0 and len(received_b) > 0:
-        print("\n✅ SUCCESS: TCP communication working!")
+        print("\nSUCCESS: TCP communication working!")
     else:
-        print("\n❌ FAILURE: No messages received")
+        print("\nFAILURE: No messages received")
     
     # Cleanup
     print("\nShutting down...")
@@ -190,7 +190,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\nInterrupted by user")
     except Exception as e:
-        print(f"\n\n❌ Error: {e}")
+        print(f"\n\nError: {e}")
         import traceback
         traceback.print_exc()
     
